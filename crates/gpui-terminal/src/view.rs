@@ -975,6 +975,15 @@ impl TerminalView {
     }
 }
 
+/// Traces the text input protocol while developing (debug builds only).
+macro_rules! ime_trace {
+    ($($arg:tt)*) => {
+        if cfg!(debug_assertions) {
+            eprintln!("[ime] {}", format!($($arg)*));
+        }
+    };
+}
+
 /// The text input protocol. Without it macOS cannot start dictation in the window (it beeps and
 /// closes), and the emoji picker, accents and other input methods do nothing.
 impl EntityInputHandler for TerminalView {
@@ -986,6 +995,7 @@ impl EntityInputHandler for TerminalView {
         _cx: &mut Context<Self>,
     ) -> Option<String> {
         // A terminal has no editable document to read back.
+        ime_trace!("text_for_range {:?}", _range);
         *adjusted_range = Some(0..0);
         Some(String::new())
     }
@@ -996,6 +1006,7 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
+        ime_trace!("selected_text_range");
         Some(UTF16Selection {
             range: 0..0,
             reversed: false,
@@ -1013,6 +1024,7 @@ impl EntityInputHandler for TerminalView {
     }
 
     fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        ime_trace!("unmark_text");
         if self.marked_text.take().is_some() {
             cx.notify();
         }
@@ -1027,6 +1039,7 @@ impl EntityInputHandler for TerminalView {
     ) {
         // Final text from the keyboard, an accent, the emoji picker or dictation. A terminal
         // takes Enter as carriage return.
+        ime_trace!("replace_text_in_range range={:?} text={:?}", _range, text);
         self.marked_text = None;
         if !text.is_empty() {
             let text = text.replace("\r\n", "\r").replace('\n', "\r");
@@ -1044,6 +1057,7 @@ impl EntityInputHandler for TerminalView {
         cx: &mut Context<Self>,
     ) {
         // Work in progress: a dead key waiting for its letter, or what dictation heard so far.
+        ime_trace!("replace_and_mark_text_in_range text={:?}", new_text);
         self.marked_text = if new_text.is_empty() {
             None
         } else {
@@ -1059,7 +1073,9 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        Some(self.cursor_bounds(element_bounds))
+        let b = self.cursor_bounds(element_bounds);
+        ime_trace!("bounds_for_range -> {:?}", b);
+        Some(b)
     }
 
     fn character_index_for_point(
@@ -1084,6 +1100,7 @@ impl Render for TerminalView {
         let padding = self.config.padding;
         let view = cx.entity();
         let focus_handle = self.focus_handle.clone();
+        let marked_text = self.marked_text.clone();
 
         div()
             .size_full()
@@ -1162,6 +1179,12 @@ impl Render for TerminalView {
 
                         // Paint the terminal with measured dimensions
                         measured_renderer.paint(bounds, padding, &term, window, cx);
+
+                        // What the input method is composing, drawn at the cursor.
+                        if let Some(text) = &marked_text {
+                            measured_renderer
+                                .paint_composition(text, bounds, padding, &term, window, cx);
+                        }
                     },
                 )
                 .size_full(),

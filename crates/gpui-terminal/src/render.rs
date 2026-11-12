@@ -630,6 +630,85 @@ impl TerminalRenderer {
             Default::default(),
         ));
     }
+
+    /// Draws text the system input method is still composing (what dictation has heard so far, or
+    /// an accent waiting for its letter) at the cursor, underlined on a tinted background, so you
+    /// can see it before it is sent to the shell.
+    pub fn paint_composition(
+        &self,
+        text: &str,
+        bounds: Bounds<Pixels>,
+        padding: Edges<Pixels>,
+        term: &Term<GpuiEventProxy>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        let colors = term.colors();
+        let cursor = term.grid().cursor.point;
+        let x = bounds.origin.x + padding.left + self.cell_width * (cursor.column.0 as f32);
+        let y = bounds.origin.y + padding.top + self.cell_height * (cursor.line.0 as f32);
+        let mut fg = self.palette.resolve(
+            Color::Named(alacritty_terminal::vte::ansi::NamedColor::Foreground),
+            colors,
+        );
+        let bg = self.palette.resolve(
+            Color::Named(alacritty_terminal::vte::ansi::NamedColor::Background),
+            colors,
+        );
+
+        let font = Font {
+            family: self.font_family.clone().into(),
+            features: FontFeatures::default(),
+            fallbacks: None,
+            weight: FontWeight::NORMAL,
+            style: FontStyle::Normal,
+        };
+        let run = TextRun {
+            len: text.len(),
+            font,
+            color: fg,
+            background_color: None,
+            underline: Some(UnderlineStyle {
+                thickness: px(1.0),
+                color: Some(fg),
+                wavy: false,
+            }),
+            strikethrough: None,
+        };
+        let line = window
+            .text_system()
+            .shape_line(SharedString::from(text.to_string()), self.font_size, &[run], None);
+
+        // A solid patch behind the text, so it does not mix with what is already on screen.
+        fg.a = 0.22;
+        let patch = Bounds {
+            origin: Point { x, y },
+            size: Size {
+                width: line.width.max(self.cell_width),
+                height: self.cell_height,
+            },
+        };
+        window.paint_quad(quad(
+            patch,
+            px(0.0),
+            bg,
+            Edges::<Pixels>::default(),
+            transparent_black(),
+            Default::default(),
+        ));
+        window.paint_quad(quad(
+            patch,
+            px(0.0),
+            fg,
+            Edges::<Pixels>::default(),
+            transparent_black(),
+            Default::default(),
+        ));
+        let _ = line.paint(Point { x, y }, self.cell_height, window, cx);
+    }
 }
 
 #[cfg(test)]
