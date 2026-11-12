@@ -10,6 +10,7 @@ APP="target/$PROFILE/bundle/sdterm native.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "target/$PROFILE/sdterm-native" "$APP/Contents/MacOS/sdterm-native"
+cp -R resources/shell "$APP/Contents/Resources/shell"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

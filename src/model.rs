@@ -11,7 +11,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 // ---- Terminals and workspaces -------------------------------------------------------------
 
 /// A label color for a terminal. These are the user's own labels, not UI accents.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PaneColor {
     Cyan,
