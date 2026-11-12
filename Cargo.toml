@@ -1,0 +1,11 @@
+[package]
+name = "sdterm-native"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+gpui = "0.2.2"
+gpui-terminal = "0.1.0"
+parking_lot = "0.12"
+portable-pty = "0.9.0"
