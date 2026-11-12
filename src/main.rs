@@ -1,7 +1,10 @@
 //! sdterm native: a terminal workspace for macOS, Windows and Linux, drawn on the GPU.
 
 mod layout;
+mod metrics;
 mod model;
+mod monitors;
+mod resources;
 mod session;
 mod state;
 mod store;
@@ -16,8 +19,10 @@ use gpui::{
 
 use crate::state::AppState;
 use crate::theme::Theme;
+use crate::metrics::WidgetKind;
 use crate::ui::{
-    CloseTerminal, NewTerminal, NewWorkspace, OpenSettings, Quit, Root, ToggleSidebar,
+    CloseTerminal, NewTerminal, NewWorkspace, OpenSettings, PopOutCpu, PopOutCpuRam, PopOutDisk,
+    PopOutNet, PopOutProcesses, PopOutRam, PopOutSummary, Quit, Root, ToggleSidebar,
 };
 
 fn main() {
@@ -41,6 +46,21 @@ fn main() {
             KeyBinding::new(&m("q"), Quit, None),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
+        macro_rules! pop_out {
+            ($($action:ident => $kind:expr),* $(,)?) => {$(
+                let st = state.clone();
+                cx.on_action(move |_: &$action, cx| crate::monitors::open(cx, $kind, &st));
+            )*};
+        }
+        pop_out!(
+            PopOutSummary => WidgetKind::Summary,
+            PopOutCpu => WidgetKind::Cpu,
+            PopOutCpuRam => WidgetKind::CpuRam,
+            PopOutRam => WidgetKind::Ram,
+            PopOutDisk => WidgetKind::Disk,
+            PopOutNet => WidgetKind::Net,
+            PopOutProcesses => WidgetKind::Processes,
+        );
         cx.set_menus(vec![
             Menu {
                 name: "sdterm".into(),
@@ -57,6 +77,20 @@ fn main() {
                     MenuItem::action("Close Terminal", CloseTerminal),
                     MenuItem::separator(),
                     MenuItem::action("New Workspace", NewWorkspace),
+                ],
+            },
+            Menu {
+                name: "Resources".into(),
+                items: vec![
+                    MenuItem::action("Pop Out Resources Summary", PopOutSummary),
+                    MenuItem::separator(),
+                    MenuItem::action("Pop Out CPU", PopOutCpu),
+                    MenuItem::action("Pop Out CPU and RAM", PopOutCpuRam),
+                    MenuItem::action("Pop Out RAM", PopOutRam),
+                    MenuItem::action("Pop Out Disk I/O", PopOutDisk),
+                    MenuItem::action("Pop Out Network I/O", PopOutNet),
+                    MenuItem::separator(),
+                    MenuItem::action("Processes", PopOutProcesses),
                 ],
             },
             Menu {

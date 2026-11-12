@@ -104,7 +104,7 @@ pub fn sidebar(snap: &Snapshot, theme: &Theme, state: &Entity<AppState>) -> AnyE
                 })),
         )
         .child(list)
-        .child(super::resources_summary(theme, snap))
+        .child(super::summary::resources_summary(theme, snap, state))
         .child(
             // The brand is always on screen, small and quiet.
             div()

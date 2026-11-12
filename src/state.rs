@@ -8,8 +8,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use gpui::{Context, Task};
+use gpui::{AnyWindowHandle, AppContext, Context, Entity, Task};
 
+use crate::metrics::WidgetKind;
+use crate::resources::ResourceFeed;
 use crate::model::{
     LayoutId, PANE_COLORS, Pane, PaneColor, PersistedWorkspaces, Settings, StoreData, Workspace, new_id,
 };
@@ -68,6 +70,9 @@ pub struct AppState {
     /// The running shells, by terminal id.
     pub sessions: HashMap<String, Session>,
     pub view: View,
+    pub resources: Entity<ResourceFeed>,
+    /// The pop-out windows that are open.
+    pub widgets: HashMap<WidgetKind, AnyWindowHandle>,
     pub settings_section: SettingsSection,
     pub sidebar_collapsed: bool,
     pub show_parked: bool,
@@ -143,11 +148,14 @@ impl AppState {
             });
         }
 
+        let resources = cx.new(|cx| ResourceFeed::new(data.settings.resources.interval_ms, cx));
         let mut state = Self {
             data,
             window_id,
             sessions: HashMap::new(),
             view: View::Terminals,
+            resources,
+            widgets: HashMap::new(),
             settings_section: SettingsSection::Appearance,
             sidebar_collapsed: false,
             show_parked: false,
@@ -382,6 +390,8 @@ impl AppState {
         );
         let theme = Theme::for_mode(self.data.settings.appearance.theme, dark);
         cx.set_global(theme.clone());
+        let interval = self.data.settings.resources.interval_ms;
+        self.resources.update(cx, |feed, _| feed.interval_ms = interval);
         let settings = self.data.settings.terminal.clone();
         for session in self.sessions.values() {
             let config = session::terminal_config(&settings, &theme);

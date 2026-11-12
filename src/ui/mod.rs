@@ -3,11 +3,13 @@
 //! Views only read a snapshot of the state and call methods on it; they never change data
 //! themselves, so everything they do goes through the same checks and the same saving.
 
+pub(crate) mod charts;
 mod controls;
 mod panes;
 mod parts;
 mod settings;
 mod sidebar;
+mod summary;
 
 use std::collections::{HashMap, HashSet};
 
@@ -17,14 +19,29 @@ use gpui::{
 };
 use gpui_terminal::TerminalView;
 
-use crate::model::{Settings, Workspace};
+use crate::model::{NetworkUnit, Settings, Workspace};
+use crate::resources::Sample;
 use crate::state::{AppState, Edit, Menu, SettingsSection, View};
 use crate::text_input::{InputEvent, TextInput};
 use crate::theme::Theme;
 
 actions!(
     sdterm,
-    [NewTerminal, CloseTerminal, NewWorkspace, ToggleSidebar, OpenSettings, Quit]
+    [
+        NewTerminal,
+        CloseTerminal,
+        NewWorkspace,
+        ToggleSidebar,
+        OpenSettings,
+        Quit,
+        PopOutSummary,
+        PopOutCpu,
+        PopOutCpuRam,
+        PopOutRam,
+        PopOutDisk,
+        PopOutNet,
+        PopOutProcesses
+    ]
 );
 
 pub(crate) const MAC: bool = cfg!(target_os = "macos");
@@ -43,6 +60,8 @@ pub(crate) struct Snapshot {
     pub focused: HashSet<String>,
     pub menu: Option<Menu>,
     pub settings: Settings,
+    pub samples: Vec<Sample>,
+    pub network_unit: NetworkUnit,
     pub settings_section: SettingsSection,
     pub confirm_reset: bool,
     /// The text fields of the settings page.
@@ -76,17 +95,14 @@ impl Snapshot {
             focused,
             menu: state.menu.clone(),
             settings: state.data.settings.clone(),
+            samples: state.resources.read(cx).samples.iter().copied().collect(),
+            network_unit: state.data.settings.resources.network_unit,
             settings_section: state.settings_section,
             confirm_reset: state.confirm_reset,
             setting_inputs,
             editor,
         }
     }
-}
-
-/// The monitors at the bottom of the sidebar (CPU, RAM, disk, network).
-pub(crate) fn resources_summary(_theme: &Theme, _snap: &Snapshot) -> AnyElement {
-    div().into_any_element()
 }
 
 // ---- The root view -------------------------------------------------------------------------
@@ -97,12 +113,15 @@ pub struct Root {
     editor: Option<(Edit, Entity<TextInput>, Subscription)>,
     setting_inputs: HashMap<&'static str, (Entity<TextInput>, Subscription)>,
     _observe: Subscription,
+    _feed: Subscription,
 }
 
 impl Root {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let _observe = cx.observe(&state, |_, _, cx| cx.notify());
-        Self { state, focus_subs: HashMap::new(), editor: None, setting_inputs: HashMap::new(), _observe }
+        let feed = state.read(cx).resources.clone();
+        let _feed = cx.observe(&feed, |_, _, cx| cx.notify());
+        Self { state, focus_subs: HashMap::new(), editor: None, setting_inputs: HashMap::new(), _observe, _feed }
     }
 
     /// Keeps the state in step with where the keyboard focus is, and moves it when asked.
