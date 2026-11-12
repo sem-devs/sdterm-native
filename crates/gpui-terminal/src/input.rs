@@ -114,6 +114,12 @@ use gpui::Keystroke;
 /// assert_eq!(bytes, Some(b"\r".to_vec()));
 /// ```
 pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
+    // Arrows and navigation keys with Shift, Alt or Ctrl: the xterm form programs understand, such
+    // as ESC [ 1 ; 5 C for Ctrl+Right (word jumps in readline, selections in editors).
+    if let Some(bytes) = modified_navigation_bytes(keystroke) {
+        return Some(bytes);
+    }
+
     // Handle special keys first
     match keystroke.key.as_str() {
         // Basic control characters
@@ -256,6 +262,62 @@ pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u
 
     // If we get here, the keystroke doesn't produce any output
     None
+}
+
+/// The xterm modifier number: 1, plus 1 for Shift, 2 for Alt, 4 for Ctrl.
+fn modifier_number(m: &gpui::Modifiers) -> u8 {
+    1 + m.shift as u8 + 2 * m.alt as u8 + 4 * m.control as u8
+}
+
+/// Arrows, Home, End, Insert, Delete, Page Up and Page Down pressed with Shift, Alt or Ctrl.
+/// Cmd (the platform key) is not part of it: it never reaches the shell as a modifier.
+fn modified_navigation_bytes(keystroke: &Keystroke) -> Option<Vec<u8>> {
+    let m = &keystroke.modifiers;
+    if !(m.shift || m.alt || m.control) {
+        return None;
+    }
+    let n = modifier_number(m);
+    let letter = match keystroke.key.as_str() {
+        "up" => 'A',
+        "down" => 'B',
+        "right" => 'C',
+        "left" => 'D',
+        "home" => 'H',
+        "end" => 'F',
+        _ => {
+            let code = match keystroke.key.as_str() {
+                "insert" => 2,
+                "delete" => 3,
+                "pageup" => 5,
+                "pagedown" => 6,
+                _ => return None,
+            };
+            return Some(format!("\x1b[{code};{n}~").into_bytes());
+        }
+    };
+    Some(format!("\x1b[1;{n}{letter}").into_bytes())
+}
+
+/// The text-editing shortcuts macOS users expect from Terminal.app, as the bytes a shell reads
+/// (readline and zsh bind them): Cmd+Left and Cmd+Right go to the start and end of the line,
+/// Cmd+Backspace deletes to the start of the line, Option+Left and Option+Right move by a word,
+/// Option+Backspace deletes the previous word and Option+Delete the next one.
+pub fn mac_editing_bytes(keystroke: &Keystroke) -> Option<Vec<u8>> {
+    let m = &keystroke.modifiers;
+    if m.shift || m.control || m.platform == m.alt {
+        return None; // exactly one of Cmd and Option
+    }
+    let bytes: &[u8] = match (m.platform, keystroke.key.as_str()) {
+        (true, "left") => b"\x01",
+        (true, "right") => b"\x05",
+        (true, "backspace") => b"\x15",
+        (false, "left") => b"\x1bb",
+        (false, "right") => b"\x1bf",
+        (false, "backspace") => b"\x17",
+        (false, "delete") => b"\x1bd",
+        _ => return None,
+    };
+    Some(bytes.to_vec())
 }
 
 #[cfg(test)]
@@ -428,5 +490,44 @@ mod tests {
 
         let space = Keystroke::parse("space").unwrap();
         assert_eq!(keystroke_to_bytes(&space, mode), Some(b" ".to_vec()));
+    }
+
+    fn with(key: &str, f: impl FnOnce(&mut gpui::Modifiers)) -> Keystroke {
+        let mut k = Keystroke::parse(key).unwrap();
+        f(&mut k.modifiers);
+        k
+    }
+
+    #[test]
+    fn mac_editing_keys() {
+        let cmd = |key| with(key, |m| m.platform = true);
+        let opt = |key| with(key, |m| m.alt = true);
+        assert_eq!(mac_editing_bytes(&cmd("left")), Some(b"\x01".to_vec()));
+        assert_eq!(mac_editing_bytes(&cmd("right")), Some(b"\x05".to_vec()));
+        assert_eq!(mac_editing_bytes(&cmd("backspace")), Some(b"\x15".to_vec()));
+        assert_eq!(mac_editing_bytes(&opt("left")), Some(b"\x1bb".to_vec()));
+        assert_eq!(mac_editing_bytes(&opt("right")), Some(b"\x1bf".to_vec()));
+        assert_eq!(mac_editing_bytes(&opt("backspace")), Some(b"\x17".to_vec()));
+        assert_eq!(mac_editing_bytes(&opt("delete")), Some(b"\x1bd".to_vec()));
+        // Not these: plain keys, other letters, other modifiers on top.
+        assert_eq!(mac_editing_bytes(&Keystroke::parse("left").unwrap()), None);
+        assert_eq!(mac_editing_bytes(&cmd("a")), None);
+        assert_eq!(mac_editing_bytes(&with("left", |m| { m.platform = true; m.shift = true })), None);
+        assert_eq!(mac_editing_bytes(&with("left", |m| { m.platform = true; m.alt = true })), None);
+    }
+
+    #[test]
+    fn arrows_and_navigation_keys_carry_their_modifiers() {
+        let mode = TermMode::empty();
+        let ctrl = |key| with(key, |m| m.control = true);
+        assert_eq!(keystroke_to_bytes(&ctrl("right"), mode), Some(b"\x1b[1;5C".to_vec()));
+        assert_eq!(keystroke_to_bytes(&ctrl("left"), mode), Some(b"\x1b[1;5D".to_vec()));
+        assert_eq!(keystroke_to_bytes(&with("up", |m| m.shift = true), mode), Some(b"\x1b[1;2A".to_vec()));
+        assert_eq!(keystroke_to_bytes(&with("left", |m| m.alt = true), mode), Some(b"\x1b[1;3D".to_vec()));
+        assert_eq!(keystroke_to_bytes(&with("end", |m| { m.shift = true; m.control = true }), mode), Some(b"\x1b[1;6F".to_vec()));
+        assert_eq!(keystroke_to_bytes(&ctrl("delete"), mode), Some(b"\x1b[3;5~".to_vec()));
+        assert_eq!(keystroke_to_bytes(&with("pageup", |m| m.shift = true), mode), Some(b"\x1b[5;2~".to_vec()));
+        // Without modifiers nothing changes.
+        assert_eq!(keystroke_to_bytes(&Keystroke::parse("right").unwrap(), mode), Some(b"\x1b[C".to_vec()));
     }
 }

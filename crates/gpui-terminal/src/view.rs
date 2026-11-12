@@ -50,6 +50,7 @@
 use crate::colors::ColorPalette;
 use crate::event::{GpuiEventProxy, TerminalEvent};
 use crate::input::keystroke_to_bytes;
+use crate::input::mac_editing_bytes;
 use crate::links::{self, Link};
 use crate::render::{PaintExtras, TerminalRenderer};
 use crate::terminal::TerminalState;
@@ -425,6 +426,29 @@ fn escape_regex(text: &str) -> String {
     out
 }
 
+#[derive(Clone, Copy)]
+enum MenuAction {
+    Copy,
+    Paste,
+    SelectAll,
+    Clear,
+}
+
+/// A file path as the shell reads it: left alone when it has nothing special, otherwise quoted.
+fn shell_quote_for(path: &str, windows: bool) -> String {
+    if windows {
+        if path.chars().any(|c| c.is_whitespace() || "&()[]{}^=;!'+,`~".contains(c)) {
+            format!("\"{path}\"")
+        } else {
+            path.to_string()
+        }
+    } else if !path.is_empty() && path.chars().all(|c| c.is_ascii_alphanumeric() || "_-./:@%+=,".contains(c)) {
+        path.to_string()
+    } else {
+        format!("'{}'", path.replace('\'', "'\\''"))
+    }
+}
+
 /// The key that makes links work: Cmd on a Mac, Ctrl elsewhere.
 fn link_modifier(m: &Modifiers) -> bool {
     if cfg!(target_os = "macos") { m.platform } else { m.control }
@@ -483,6 +507,9 @@ pub struct TerminalView {
 
     /// Find in the output.
     search: Search,
+
+    /// The right-click menu, where it was opened (relative to the terminal).
+    menu: Option<Point<Pixels>>,
 
     /// The title the program set (OSC 0 or 2).
     title: String,
@@ -553,6 +580,17 @@ mod key_tests {
         alt.modifiers.alt = true;
         assert!(types_text(&alt, false));
         assert!(!types_text(&alt, true));
+    }
+
+    #[test]
+    fn dropped_paths_are_quoted_for_the_shell() {
+        use super::shell_quote_for;
+        assert_eq!(shell_quote_for("/Users/me/notes.txt", false), "/Users/me/notes.txt");
+        assert_eq!(shell_quote_for("/Users/me/My Project", false), "'/Users/me/My Project'");
+        assert_eq!(shell_quote_for("/tmp/it's here", false), "'/tmp/it'\\''s here'");
+        assert_eq!(shell_quote_for("/tmp/$HOME;rm", false), "'/tmp/$HOME;rm'");
+        assert_eq!(shell_quote_for("C:\\Users\\me\\file.txt", true), "C:\\Users\\me\\file.txt");
+        assert_eq!(shell_quote_for("C:\\Users\\me\\My Docs", true), "\"C:\\Users\\me\\My Docs\"");
     }
 
     #[test]
@@ -705,6 +743,7 @@ impl TerminalView {
             _blink_task: blink_task,
             hover_link: None,
             search: Search::default(),
+            menu: None,
             title: String::new(),
             _reader_task: reader_task,
             resize_callback: None,
@@ -928,6 +967,13 @@ impl TerminalView {
 
         let ks = &event.keystroke;
         let m = &ks.modifiers;
+        if self.menu.take().is_some() {
+            cx.notify();
+            if ks.key == "escape" {
+                cx.stop_propagation();
+                return;
+            }
+        }
         // Copy, paste and find: Cmd+C / V / F on a Mac, Ctrl+Shift+C / V / F elsewhere (plain
         // Ctrl+C is the interrupt and must reach the shell).
         let chord = |key: &str| {
@@ -966,6 +1012,21 @@ impl TerminalView {
         if self.search.open {
             cx.stop_propagation();
             return;
+        }
+
+        // Terminal.app's own editing keys, and Cmd+K to clear.
+        if cfg!(target_os = "macos") {
+            if ks.key == "k" && m.platform && !m.alt && !m.control && !m.shift {
+                self.clear_terminal(cx);
+                cx.stop_propagation();
+                return;
+            }
+            if let Some(bytes) = mac_editing_bytes(ks) {
+                self.on_user_input();
+                self.write_to_shell(&bytes);
+                cx.stop_propagation();
+                return;
+            }
         }
 
         if let Some(bytes) = keystroke_to_bytes(&event.keystroke, self.state.mode()) {
@@ -1032,8 +1093,13 @@ impl TerminalView {
     /// Pastes the clipboard. Programs that ask for it get the text marked as a paste, so an editor
     /// does not treat it as typing.
     fn paste_clipboard(&mut self, cx: &mut Context<Self>) {
-        use alacritty_terminal::term::TermMode;
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else { return };
+        self.paste_text(&text);
+    }
+
+    /// Pastes text into the shell, marked as a paste for programs that ask for it.
+    fn paste_text(&mut self, text: &str) {
+        use alacritty_terminal::term::TermMode;
         if text.is_empty() {
             return;
         }
@@ -1098,6 +1164,9 @@ impl TerminalView {
     fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         use alacritty_terminal::selection::{Selection, SelectionType};
         window.focus(&self.focus_handle);
+        if self.menu.take().is_some() {
+            cx.notify();
+        }
         if link_modifier(&event.modifiers) {
             if let Some(link) = self.link_under(event.position) {
                 cx.open_url(&link.url);
@@ -1395,6 +1464,153 @@ impl TerminalView {
     fn link_under(&self, position: Point<Pixels>) -> Option<Link> {
         let (point, _) = self.grid_point(position);
         self.state.with_term(|term| links::link_at(term, point))
+    }
+
+    // ---- Right-click menu, clear, select all, dropped files -----------------------------------
+
+    /// Right click: a program that tracks the mouse gets it (hold Shift for the menu), otherwise
+    /// the menu opens at the pointer.
+    fn on_right_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus_handle);
+        if self.tracks_mouse() && !event.modifiers.shift {
+            let (point, _) = self.grid_point(event.position);
+            let mods = crate::mouse::encode_modifiers(false, event.modifiers.alt, event.modifiers.control);
+            let screen = self.screen_point(point);
+            if let Some(bytes) =
+                crate::mouse::mouse_button_report(MouseButton::Right, true, screen, mods, self.state.mode())
+            {
+                self.write_to_shell(&bytes);
+            }
+            return;
+        }
+        let origin = self.paint_info.lock().bounds.origin;
+        self.menu = Some(event.position - origin);
+        cx.notify();
+    }
+
+    fn on_right_up(&mut self, event: &MouseUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+        if self.tracks_mouse() && !event.modifiers.shift {
+            let (point, _) = self.grid_point(event.position);
+            let mods = crate::mouse::encode_modifiers(false, event.modifiers.alt, event.modifiers.control);
+            let screen = self.screen_point(point);
+            if let Some(bytes) =
+                crate::mouse::mouse_button_report(MouseButton::Right, false, screen, mods, self.state.mode())
+            {
+                self.write_to_shell(&bytes);
+            }
+        }
+    }
+
+    fn has_selection(&self) -> bool {
+        self.state.with_term(|term| term.selection.as_ref().is_some_and(|s| !s.is_empty()))
+    }
+
+    fn menu_action(&mut self, action: MenuAction, cx: &mut Context<Self>) {
+        self.menu = None;
+        match action {
+            MenuAction::Copy => self.copy_selection(cx),
+            MenuAction::Paste => self.paste_clipboard(cx),
+            MenuAction::SelectAll => self.select_all(),
+            MenuAction::Clear => self.clear_terminal(cx),
+        }
+        cx.notify();
+    }
+
+    /// Selects everything: the history and the screen.
+    fn select_all(&mut self) {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::{Column, Side};
+        use alacritty_terminal::selection::{Selection, SelectionType};
+        self.state.with_term_mut(|term| {
+            let start = AlacPoint::new(term.topmost_line(), Column(0));
+            let end = AlacPoint::new(term.bottommost_line(), term.last_column());
+            let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
+            selection.update(end, Side::Right);
+            term.selection = Some(selection);
+        });
+    }
+
+    /// Clears the history and the screen; the shell redraws its prompt (Ctrl+L), like Cmd+K in
+    /// Terminal.app.
+    fn clear_terminal(&mut self, cx: &mut Context<Self>) {
+        use alacritty_terminal::grid::Scroll;
+        self.state.with_term_mut(|term| {
+            term.scroll_display(Scroll::Bottom);
+            term.grid_mut().clear_history();
+            term.selection = None;
+        });
+        if self.search.open {
+            self.search.dirty = true;
+        }
+        self.write_to_shell(b"\x0c");
+        cx.notify();
+    }
+
+    /// Files dropped on the terminal type their paths, quoted for the shell.
+    fn drop_paths(&mut self, paths: &[std::path::PathBuf], window: &mut Window, cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            return;
+        }
+        window.focus(&self.focus_handle);
+        let mut text = paths
+            .iter()
+            .map(|p| shell_quote_for(&p.to_string_lossy(), cfg!(windows)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        text.push(' ');
+        self.paste_text(&text);
+        cx.notify();
+    }
+
+    /// The right-click menu.
+    fn context_menu(&self, at: Point<Pixels>, colors: (Hsla, Hsla, Hsla, Hsla), cx: &mut Context<Self>) -> AnyElement {
+        let (bg, fg, border, muted) = colors;
+        let hover = fg.opacity(0.14);
+        let has_selection = self.has_selection();
+        let size = self.paint_info.lock().bounds.size;
+        // Keep the menu inside the terminal.
+        let x = f32::from(at.x).min((f32::from(size.width) - 184.0).max(0.0)).max(0.0);
+        let y = f32::from(at.y).min((f32::from(size.height) - 140.0).max(0.0)).max(0.0);
+        let item = |id: &'static str, label: &'static str, enabled: bool, action: MenuAction| {
+            let row = div().id(id).px_3().py_1().rounded_md().text_color(if enabled { fg } else { muted.opacity(0.7) });
+            if enabled {
+                row.cursor_pointer()
+                    .hover(move |s| s.bg(hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.menu_action(action, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .child(label)
+            } else {
+                row.child(label)
+            }
+        };
+        div()
+            .absolute()
+            .left(px(x))
+            .top(px(y))
+            .w(px(170.))
+            .flex()
+            .flex_col()
+            .p_1()
+            .rounded_lg()
+            .border_1()
+            .border_color(border)
+            .bg(bg)
+            .text_color(fg)
+            .text_size(px(13.))
+            .font_family(".SystemUIFont")
+            .shadow_lg()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+            .child(item("menu-copy", "Copy", has_selection, MenuAction::Copy))
+            .child(item("menu-paste", "Paste", true, MenuAction::Paste))
+            .child(item("menu-select-all", "Select All", true, MenuAction::SelectAll))
+            .child(item("menu-clear", "Clear", true, MenuAction::Clear))
+            .into_any_element()
     }
 
     // ---- Find ---------------------------------------------------------------------------
@@ -1742,7 +1958,10 @@ impl Render for TerminalView {
         let active_match = self.search.active;
         let link = self.hover_link.as_ref().map(|l| (l.start, l.end));
         let cursor_on = self.blink_on;
-        let search_bar = if self.search.open {
+        if !focused {
+            self.menu = None;
+        }
+        let overlay_colors = (self.search.open || self.menu.is_some()).then(|| {
             let (bg, fg) = {
                 let term = state_arc.lock();
                 let colors = term.colors();
@@ -1752,9 +1971,15 @@ impl Render for TerminalView {
                     renderer.palette.resolve(TermColor::Named(NamedColor::Foreground), colors),
                 )
             };
-            Some(self.search_bar(bg.blend(fg.opacity(0.12)), fg, fg.opacity(0.25), fg.opacity(0.55), cx))
-        } else {
-            None
+            (bg.blend(fg.opacity(0.12)), fg, fg.opacity(0.25), fg.opacity(0.55))
+        });
+        let search_bar = match overlay_colors {
+            Some((bg, fg, border, muted)) if self.search.open => Some(self.search_bar(bg, fg, border, muted, cx)),
+            _ => None,
+        };
+        let context_menu = match (overlay_colors, self.menu) {
+            (Some(colors), Some(at)) => Some(self.context_menu(at, colors, cx)),
+            _ => None,
         };
 
         div()
@@ -1779,6 +2004,11 @@ impl Render for TerminalView {
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_down))
+            .on_mouse_up(MouseButton::Right, cx.listener(Self::on_right_up))
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.drop_paths(paths.paths(), window, cx);
+            }))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .child(
@@ -1875,6 +2105,7 @@ impl Render for TerminalView {
                 .size_full(),
             )
             .children(search_bar)
+            .children(context_menu)
     }
 }
 
