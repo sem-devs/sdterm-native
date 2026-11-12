@@ -447,6 +447,59 @@ pub struct TerminalView {
     exit_callback: Option<ExitCallback>,
 }
 
+/// Whether a key press types text, which belongs to the system input method (letters, digits,
+/// symbols, accents, dictation). Enter and Tab carry "\n" and "\t" as their character, but the
+/// input method never delivers those as text (macOS runs them as editing commands), so they must
+/// go straight to the shell or the key would do nothing.
+fn types_text(ks: &Keystroke, option_as_meta: bool) -> bool {
+    let m = &ks.modifiers;
+    ks.key_char.as_deref().is_some_and(|c| c.chars().any(|ch| !ch.is_control()))
+        && !m.control
+        && !m.platform
+        && !m.function
+        && !(m.alt && option_as_meta)
+}
+
+#[cfg(test)]
+mod key_tests {
+    // No glob import: gpui exports its own `test` macro, which would shadow the built-in one.
+    use super::types_text;
+    use gpui::Keystroke;
+
+    fn key(key: &str, key_char: Option<&str>) -> Keystroke {
+        Keystroke { modifiers: Default::default(), key: key.into(), key_char: key_char.map(Into::into) }
+    }
+
+    #[test]
+    fn enter_and_tab_go_to_the_shell_not_to_the_input_method() {
+        assert!(!types_text(&key("enter", Some("\n")), false));
+        assert!(!types_text(&key("tab", Some("\t")), false));
+        assert!(!types_text(&key("backspace", None), false));
+    }
+
+    #[test]
+    fn letters_and_space_go_to_the_input_method() {
+        assert!(types_text(&key("a", Some("a")), false));
+        assert!(types_text(&key("space", Some(" ")), false));
+        assert!(types_text(&key("@", Some("@")), false));
+    }
+
+    #[test]
+    fn option_types_characters_unless_it_is_meta() {
+        let mut alt = key("a", Some("å"));
+        alt.modifiers.alt = true;
+        assert!(types_text(&alt, false));
+        assert!(!types_text(&alt, true));
+    }
+
+    #[test]
+    fn control_and_command_chords_go_to_the_shell() {
+        let mut ctrl_c = key("c", Some("c"));
+        ctrl_c.modifiers.control = true;
+        assert!(!types_text(&ctrl_c, false));
+    }
+}
+
 impl TerminalView {
     /// Create a new terminal with provided I/O streams.
     ///
@@ -816,12 +869,7 @@ impl TerminalView {
             _cx.stop_propagation();
             return;
         }
-        let types_text = ks.key_char.is_some()
-            && !m.control
-            && !m.platform
-            && !m.function
-            && !(m.alt && self.option_as_meta);
-        if types_text {
+        if types_text(ks, self.option_as_meta) {
             return; // propagate: GPUI hands the key to the input method
         }
 
