@@ -712,7 +712,7 @@ impl AppState {
     /// download page instead.
     pub fn install_update(&mut self, cx: &mut Context<Self>) {
         let Some(offer) = self.offer.clone() else { return };
-        if !cfg!(target_os = "macos") {
+        if !updater::can_install() {
             cx.open_url(updater::DOWNLOAD_PAGE);
             return;
         }
@@ -748,7 +748,7 @@ impl AppState {
                 .background_executor()
                 .spawn(async move {
                     let zip = updater::download(&offer, |n| p.store(n, std::sync::atomic::Ordering::Relaxed))?;
-                    updater::install_mac(&zip)
+                    updater::install(&zip)
                 })
                 .await;
             f.store(true, std::sync::atomic::Ordering::Relaxed);
