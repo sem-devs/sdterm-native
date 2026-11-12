@@ -13,7 +13,7 @@ use gpui::{App, AppContext, Edges, Entity, px};
 use gpui_terminal::{TerminalConfig, TerminalView};
 use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
 
-use crate::model::{FontChoice, TerminalSettings};
+use crate::model::{CursorStyle, FontChoice, TerminalSettings};
 use crate::store;
 use crate::theme::Theme;
 
@@ -125,7 +125,7 @@ fn mono_font(settings: &TerminalSettings) -> String {
         FontChoice::Custom if !settings.custom_font_family.trim().is_empty() => {
             settings.custom_font_family.trim().to_string()
         }
-        // The bundled Geist Mono comes with the polish step; until then the system mono font.
+        FontChoice::GeistMono => "Geist Mono".to_string(),
         _ => platform.to_string(),
     }
 }
@@ -137,6 +137,11 @@ pub fn terminal_config(settings: &TerminalSettings, theme: &Theme) -> TerminalCo
         cols: 80,
         rows: 24,
         scrollback: settings.scrollback as usize,
+        cursor_shape: match settings.cursor_style {
+            CursorStyle::Block => gpui_terminal::CursorShape::Block,
+            CursorStyle::Bar => gpui_terminal::CursorShape::Beam,
+            CursorStyle::Underline => gpui_terminal::CursorShape::Underline,
+        },
         line_height_multiplier: settings.line_height as f32,
         padding: Edges::all(px(8.0)),
         colors: theme.terminal_palette(),

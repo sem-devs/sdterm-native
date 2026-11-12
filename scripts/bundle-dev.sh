@@ -11,6 +11,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "target/$PROFILE/sdterm-native" "$APP/Contents/MacOS/sdterm-native"
 cp -R resources/shell "$APP/Contents/Resources/shell"
+cp resources/icon.icns "$APP/Contents/Resources/icon.icns"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -19,6 +20,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key><string>sdterm-native</string>
   <key>CFBundleIdentifier</key><string>com.semdevs.sdterm.native</string>
   <key>CFBundleName</key><string>sdterm native</string>
+  <key>CFBundleIconFile</key><string>icon</string>
   <key>CFBundleDisplayName</key><string>sdterm native</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>

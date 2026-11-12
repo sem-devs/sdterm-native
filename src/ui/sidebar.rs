@@ -122,13 +122,7 @@ pub fn sidebar(snap: &Snapshot, theme: &Theme, state: &Entity<AppState>) -> AnyE
                         .flex()
                         .items_center()
                         .gap_2p5()
-                        .child(
-                            div()
-                                .text_size(px(12.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme.muted_foreground)
-                                .child("SEM Devs"),
-                        )
+                        .child(brand_logo(theme))
                         .child(
                             div()
                                 .text_size(px(11.))
@@ -239,6 +233,28 @@ fn workspace_item(
         row = row.child(overlay(workspace_menu(ws, snap, theme, state)));
     }
     row.into_any_element()
+}
+
+/// The SEM Devs logo: the wordmark in the text color, the two squares in the brand colors. Small and
+/// quiet, as the brand book allows here.
+fn brand_logo(theme: &Theme) -> AnyElement {
+    let layer = |path: &'static str| gpui::svg().path(path).absolute().top_0().left_0().size_full();
+    let blue = gpui::Hsla::from(gpui::rgb(0x1D56B1));
+    let cyan = gpui::Hsla::from(gpui::rgb(0x52E5F1));
+    div()
+        .id("brand")
+        .relative()
+        .flex_none()
+        .w(px(90.))
+        .h(px(14.))
+        .cursor_pointer()
+        .opacity(0.75)
+        .hover(|s| s.opacity(1.0))
+        .child(layer("brand/wordmark.svg").text_color(theme.foreground.opacity(0.78)))
+        .child(layer("brand/icon-back.svg").text_color(blue))
+        .child(layer("brand/icon-front.svg").text_color(cyan.opacity(0.89)))
+        .on_click(|_, _, cx| cx.open_url("https://sem-devs.com"))
+        .into_any_element()
 }
 
 fn window_label(id: &str) -> String {

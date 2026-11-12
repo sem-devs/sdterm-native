@@ -159,9 +159,19 @@ impl TerminalState {
     /// let terminal = TerminalState::new(80, 24, event_proxy);
     /// ```
     pub fn new(cols: usize, rows: usize, event_proxy: GpuiEventProxy) -> Self {
-        // Create a default configuration
-        // The Config struct controls various terminal behaviors like scrolling history
-        let config = Config::default();
+        Self::with_options(cols, rows, event_proxy, 10_000, alacritty_terminal::vte::ansi::CursorShape::Block)
+    }
+
+    /// Like `new`, with how much output is kept for scrolling back and the cursor shape programs
+    /// get unless they ask for another.
+    pub fn with_options(
+        cols: usize,
+        rows: usize,
+        event_proxy: GpuiEventProxy,
+        scrollback: usize,
+        cursor: alacritty_terminal::vte::ansi::CursorShape,
+    ) -> Self {
+        let config = Self::term_config(scrollback, cursor);
 
         // Create dimensions for terminal initialization
         let dimensions = TermDimensions::new(cols, rows);
@@ -201,6 +211,17 @@ impl TerminalState {
     /// // Process some output from the PTY
     /// terminal.process_bytes(b"Hello, world!\r\n");
     /// ```
+    pub fn term_config(
+        scrollback: usize,
+        cursor: alacritty_terminal::vte::ansi::CursorShape,
+    ) -> Config {
+        let mut config = Config::default();
+        config.scrolling_history = scrollback;
+        config.default_cursor_style =
+            alacritty_terminal::vte::ansi::CursorStyle { shape: cursor, blinking: false };
+        config
+    }
+
     pub fn process_bytes(&mut self, bytes: &[u8]) {
         let mut term = self.term.lock();
         // The parser.advance method calls handler methods on the Term

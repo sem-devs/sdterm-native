@@ -127,6 +127,9 @@ pub struct TerminalConfig {
     /// Maximum number of scrollback lines to keep in history
     pub scrollback: usize,
 
+    /// The cursor shape programs get unless they ask for another.
+    pub cursor_shape: alacritty_terminal::vte::ansi::CursorShape,
+
     /// Multiplier for line height to accommodate tall glyphs (e.g., nerd fonts)
     /// Default is 1.2 (20% extra height)
     pub line_height_multiplier: f32,
@@ -148,6 +151,7 @@ impl Default for TerminalConfig {
             font_family: "monospace".into(),
             font_size: px(14.0),
             scrollback: 10000,
+            cursor_shape: alacritty_terminal::vte::ansi::CursorShape::Block,
             line_height_multiplier: 1.2,
             padding: Edges::all(px(0.0)),
             colors: ColorPalette::default(),
@@ -489,7 +493,13 @@ impl TerminalView {
         let event_proxy = GpuiEventProxy::new(event_tx);
 
         // Create terminal state
-        let state = TerminalState::new(config.cols, config.rows, event_proxy);
+        let state = TerminalState::with_options(
+            config.cols,
+            config.rows,
+            event_proxy,
+            config.scrollback,
+            config.cursor_shape,
+        );
 
         // Create renderer with font settings and color palette
         let renderer = TerminalRenderer::new(
@@ -1163,6 +1173,12 @@ impl TerminalView {
         self.renderer.font_size = config.font_size;
         self.renderer.line_height_multiplier = config.line_height_multiplier;
         self.renderer.palette = config.colors.clone();
+
+        // Scrollback and the default cursor shape change in the running terminal too.
+        self.state
+            .term_arc()
+            .lock()
+            .set_options(crate::terminal::TerminalState::term_config(config.scrollback, config.cursor_shape));
 
         // Store the new config
         self.config = config;

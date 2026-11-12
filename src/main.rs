@@ -1,5 +1,6 @@
 //! sdterm native: a terminal workspace for macOS, Windows and Linux, drawn on the GPU.
 
+mod assets;
 mod layout;
 mod metrics;
 mod model;
@@ -23,7 +24,8 @@ use crate::ui::{
 };
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    Application::new().with_assets(crate::assets::Assets).run(|cx: &mut App| {
+        crate::assets::load_fonts(cx);
         let mode = store::load().data.settings.appearance.theme;
         let system_dark =
             matches!(cx.window_appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark);

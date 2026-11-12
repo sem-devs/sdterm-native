@@ -356,3 +356,6 @@ pub use view::{
     BellCallback, ClipboardStoreCallback, ExitCallback, KeyHandler, ResizeCallback, TerminalConfig,
     TerminalView, TitleCallback,
 };
+
+/// The cursor shapes a terminal can have.
+pub use alacritty_terminal::vte::ansi::CursorShape;
