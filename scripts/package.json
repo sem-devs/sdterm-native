@@ -1,0 +1,9 @@
+{
+  "name": "sdterm-native-release-scripts",
+  "private": true,
+  "type": "module",
+  "description": "Only used by the maintainers to publish a release",
+  "dependencies": {
+    "@vercel/blob": "^2.0.0"
+  }
+}
