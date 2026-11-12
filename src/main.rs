@@ -6,8 +6,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use gpui::{
-    AppContext, Context, Edges, Entity, IntoElement, ParentElement, Render, Styled, Window, div,
-    px, rgb, App,
+    App, AppContext, Context, Edges, Entity, FontWeight, Hsla, InteractiveElement, IntoElement,
+    MouseButton, ParentElement, Render, Styled, Subscription, Window, div, px, rgb,
+    transparent_black,
 };
 use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -113,48 +114,84 @@ struct Pane {
 
 struct Grid {
     panes: Vec<Pane>,
+    /// Keeps the focus listeners alive: the grid redraws when the focused terminal changes.
+    _subs: Vec<Subscription>,
+}
+
+/// Mixes two 0xRRGGBB colors: `t` of `b` over `a`.
+fn mix(a: u32, b: u32, t: f32) -> u32 {
+    let ch = |shift: u32| {
+        let (x, y) = (((a >> shift) & 0xFF) as f32, ((b >> shift) & 0xFF) as f32);
+        ((x + (y - x) * t).round() as u32) & 0xFF
+    };
+    (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
 impl Render for Grid {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let cell = |pane: &Pane| {
-            div()
-                .flex_1()
-                .min_w(px(0.))
-                .flex()
-                .flex_col()
-                .border_t_2()
-                .border_color(rgb(pane.color))
-                .child(
-                    div()
-                        .h(px(26.))
-                        .px_3()
-                        .flex()
-                        .items_center()
-                        .bg(rgb(0x1B1B1B))
-                        .text_color(rgb(0xB0B0B0))
-                        .text_size(px(12.))
-                        .child(pane.name),
-                )
-                .child(div().flex_1().child(pane.terminal.clone()))
-        };
-        let row = |a: &Pane, b: &Pane| {
-            div()
-                .flex_1()
-                .flex()
-                .flex_row()
-                .gap_px()
-                .child(cell(a))
-                .child(cell(b))
-        };
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Same cues as the Electron app: the color bar is solid and the title bright on the
+        // terminal you are typing in or dictating to, and dimmed on the others.
+        let mut cells: Vec<_> = (0..self.panes.len())
+            .map(|i| {
+                let pane = &self.panes[i];
+                let focused = pane.terminal.read(cx).focus_handle().is_focused(window);
+                let accent: Hsla = rgb(pane.color).into();
+                div()
+                    .id(("pane", i))
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_col()
+                    .border_1()
+                    .border_color(if focused {
+                        accent.opacity(0.55)
+                    } else {
+                        transparent_black()
+                    })
+                    // A click anywhere on the pane, title included, moves the focus there.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            let handle = this.panes[i].terminal.read(cx).focus_handle().clone();
+                            window.focus(&handle);
+                        }),
+                    )
+                    .child(div().h(px(2.)).bg(accent.opacity(if focused { 1.0 } else { 0.4 })))
+                    .child(
+                        div()
+                            .h(px(26.))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .bg(rgb(if focused {
+                                mix(0x1B1B1B, pane.color, 0.14)
+                            } else {
+                                0x1B1B1B
+                            }))
+                            .text_color(rgb(if focused { 0xF2F2F2 } else { 0x8A8A8A }))
+                            .font_weight(if focused {
+                                FontWeight::SEMIBOLD
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .text_size(px(12.))
+                            .child(pane.name),
+                    )
+                    .child(div().flex_1().child(pane.terminal.clone()))
+            })
+            .collect();
+
+        let row = |a, b| div().flex_1().flex().flex_row().gap_px().child(a).child(b);
+        let (c, d) = (cells.remove(2), cells.remove(2));
+        let (a, b) = (cells.remove(0), cells.remove(0));
         div()
             .size_full()
             .bg(rgb(0x2A2A2A))
             .flex()
             .flex_col()
             .gap_px()
-            .child(row(&self.panes[0], &self.panes[1]))
-            .child(row(&self.panes[2], &self.panes[3]))
+            .child(row(a, b))
+            .child(row(c, d))
     }
 }
 
@@ -196,7 +233,15 @@ fn main() {
                         })
                         .collect::<Vec<_>>();
                     panes[0].terminal.read(cx).focus_handle().focus(window);
-                    cx.new(|_| Grid { panes })
+                    cx.new(|cx| {
+                        let mut subs = Vec::new();
+                        for pane in &panes {
+                            let handle = pane.terminal.read(cx).focus_handle().clone();
+                            subs.push(cx.on_focus_in(&handle, window, |_, _, cx| cx.notify()));
+                            subs.push(cx.on_blur(&handle, window, |_, _, cx| cx.notify()));
+                        }
+                        Grid { panes, _subs: subs }
+                    })
                 },
             )?;
             Ok::<_, anyhow::Error>(())
