@@ -32,7 +32,7 @@ jobs:
       - name: Libraries the program needs at run time
         run: ldd target/release/sdterm-native
       - name: Package (tar.gz, deb, AppImage, feed)
-        run: scripts/package-linux.sh
+        run: bash scripts/package-linux.sh
       - uses: actions/upload-artifact@v4
         with:
           name: sdterm-native-linux
