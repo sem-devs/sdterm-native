@@ -1,3 +1,4 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
 //! sdterm native: a terminal workspace for macOS, Windows and Linux, drawn on the GPU.
 
 mod assets;

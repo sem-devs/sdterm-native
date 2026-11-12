@@ -1,9 +1,15 @@
 //! Self-update.
 //!
-//! The release script publishes `latest-mac.json`, `latest-windows.json` and `latest-linux.json`
-//! next to the installers. The app reads the one for its platform, compares versions, and on
-//! macOS downloads the new app, checks its checksum and signature, swaps it in place and reopens.
-//! Elsewhere it sends you to the download page.
+//! The release publishes `latest-mac.json`, `latest-win.json` and `latest-linux.json` next to the
+//! installers. The app reads the one for its system, compares versions, downloads the file it
+//! names, checks its SHA-512 and installs it:
+//!
+//! * macOS: the zipped app is unpacked, its signature checked, and it replaces the running app.
+//! * Windows (installed with the setup): the setup runs silently over the old install, then the
+//!   new version starts.
+//! * Linux AppImage: the AppImage file is replaced and started again.
+//!
+//! Everything else (a .deb, a .tar.gz or a plain zip) is sent to the download page.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -53,22 +59,46 @@ struct FeedFile {
     arch: String,
 }
 
-pub fn platform() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "mac"
-    } else if cfg!(windows) {
-        "windows"
-    } else {
-        "linux"
-    }
-}
-
 fn arch() -> &'static str {
     match std::env::consts::ARCH {
         "aarch64" => "arm64",
         "x86_64" => "x64",
         other => other,
     }
+}
+
+/// The name of this system in the feed file: `latest-<name>.json`.
+fn feed_system() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "mac"
+    } else if cfg!(windows) {
+        "win"
+    } else {
+        "linux"
+    }
+}
+
+fn feed_file_name() -> String {
+    format!("latest-{}.json", feed_system())
+}
+
+/// The file in the feed for this computer: the one for its architecture, else the first.
+fn pick_file(files: &[FeedFile]) -> Option<&FeedFile> {
+    files.iter().find(|f| f.arch == arch()).or_else(|| files.first())
+}
+
+/// What the downloaded file is called on disk, from the extension of its address (update.exe,
+/// update.AppImage, update.zip), so an installer is recognised as one.
+fn download_name(url: &str) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let ext = path
+        .rsplit('/')
+        .next()
+        .and_then(|file| file.rsplit_once('.'))
+        .map(|(_, ext)| ext)
+        .filter(|ext| !ext.is_empty() && ext.len() <= 12 && ext.chars().all(|c| c.is_ascii_alphanumeric()))
+        .unwrap_or("bin");
+    format!("update.{ext}")
 }
 
 /// Where the update files are. `SDTERM_UPDATE_URL` points it elsewhere, for testing.
@@ -110,9 +140,9 @@ fn agent(timeout: Option<Duration>) -> ureq::Agent {
 /// Asks the feed whether there is a newer version. `None` means you are up to date.
 pub fn check(base: &str) -> Result<Option<Offer>> {
     let url = format!(
-        "{}/latest-{}.json?t={}",
+        "{}/{}?t={}",
         base.trim_end_matches('/'),
-        platform(),
+        feed_file_name(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs()
     );
     let mut response = agent(Some(Duration::from_secs(20))).get(&url).call().context("could not reach the update server")?;
@@ -121,12 +151,7 @@ pub fn check(base: &str) -> Result<Option<Offer>> {
     if !is_newer(&feed.version, CURRENT) {
         return Ok(None);
     }
-    let file = feed
-        .files
-        .iter()
-        .find(|f| f.arch == arch())
-        .or_else(|| feed.files.first())
-        .ok_or_else(|| anyhow!("the update feed has no file for this computer"))?;
+    let file = pick_file(&feed.files).ok_or_else(|| anyhow!("the update feed has no file for this computer"))?;
     let file_url = if file.url.starts_with("http") {
         file.url.clone()
     } else {
@@ -143,7 +168,7 @@ pub fn download(offer: &Offer, progress: impl Fn(u8)) -> Result<PathBuf> {
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
     let dir = std::env::temp_dir().join(format!("sdterm-update-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join("update.zip");
+    let path = dir.join(download_name(&offer.url));
     let mut out = std::fs::File::create(&path)?;
     let mut reader = response.body_mut().as_reader();
     let mut hasher = Sha512::new();
@@ -227,6 +252,110 @@ pub fn install_mac(zip: &Path) -> Result<()> {
     Ok(())
 }
 
+/// What the setup is started with by the app: silent, and "start the new version when done".
+#[cfg_attr(not(windows), allow(dead_code))]
+const WINDOWS_SETUP_ARGS: [&str; 2] = ["/S", "/UPDATE"];
+
+/// Whether this program was put here by the Windows setup (it leaves `Uninstall.exe` beside it).
+/// A program unpacked from the plain zip is not updated in place.
+fn installed_by_setup(exe: &Path) -> bool {
+    exe.parent().is_some_and(|dir| dir.join("Uninstall.exe").is_file())
+}
+
+/// The AppImage file this process was started from, if it is one. The AppImage runtime sets it.
+fn appimage_path(var: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    var.filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+/// Whether the update can be installed by the app itself. Elsewhere (a .deb, a .tar.gz, a plain
+/// zip, a development build) the app opens the download page instead.
+pub fn can_install() -> bool {
+    if cfg!(target_os = "macos") {
+        true
+    } else if cfg!(windows) {
+        std::env::current_exe().is_ok_and(|exe| installed_by_setup(&exe))
+    } else {
+        appimage_path(std::env::var_os("APPIMAGE")).is_some()
+    }
+}
+
+/// Installs the downloaded file for this system and arranges for the new version to open once this
+/// process has quit. The caller quits the app when this returns `Ok`.
+pub fn install(file: &Path) -> Result<()> {
+    if cfg!(target_os = "macos") {
+        install_mac(file)
+    } else if cfg!(windows) {
+        install_windows(file)
+    } else {
+        install_appimage(file)
+    }
+}
+
+/// Runs the downloaded setup silently. It waits for this program to quit, installs over the old
+/// version and starts the new one (see `scripts/windows/installer.nsi`).
+#[cfg(windows)]
+fn install_windows(setup: &Path) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    let exe = std::env::current_exe()?;
+    if !installed_by_setup(&exe) {
+        bail!("this copy of sdterm was not installed with the setup, so it cannot update itself: download the new setup");
+    }
+    Command::new(setup)
+        .args(WINDOWS_SETUP_ARGS)
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        .spawn()
+        .context("could not start the setup")?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn install_windows(_setup: &Path) -> Result<()> {
+    bail!("the Windows setup can only be run on Windows")
+}
+
+/// Replaces `target` with the file `new`, atomically: the new file is first written beside the
+/// target (same disk, so the final rename is one step) and renamed over it. A running AppImage
+/// keeps working from the old file until it quits.
+fn replace_file(new: &Path, target: &Path) -> Result<()> {
+    let dir = target.parent().ok_or_else(|| anyhow!("the AppImage has no folder"))?;
+    let name = target.file_name().ok_or_else(|| anyhow!("the AppImage has no name"))?.to_string_lossy().into_owned();
+    let staged = dir.join(format!(".{name}.update"));
+    let _ = std::fs::remove_file(&staged);
+    std::fs::copy(new, &staged)
+        .with_context(|| format!("sdterm cannot write in {}: move the AppImage to a folder you own", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
+    }
+    if let Err(err) = std::fs::rename(&staged, target) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(err).context("could not replace the AppImage");
+    }
+    Ok(())
+}
+
+/// Replaces the AppImage this process runs from and opens the new one after this process quits.
+fn install_appimage(new: &Path) -> Result<()> {
+    let target = appimage_path(std::env::var_os("APPIMAGE"))
+        .ok_or_else(|| anyhow!("sdterm is not running as an AppImage, so it cannot update itself: download the new version"))?;
+    replace_file(new, &target)?;
+    // Backgrounded through a shell, so it keeps running after this process is gone. The path goes
+    // in through the environment, never into the script text.
+    Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!(
+            "(while kill -0 {} 2>/dev/null; do sleep 0.3; done; exec \"$SDTERM_RELAUNCH\") >/dev/null 2>&1 &",
+            std::process::id()
+        ))
+        .env("SDTERM_RELAUNCH", &target)
+        .spawn()
+        .context("could not reopen sdterm")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,7 +424,7 @@ mod tests {
             arch(),
             sha(&payload)
         );
-        let name: &'static str = Box::leak(format!("/latest-{}.json", platform()).into_boxed_str());
+        let name: &'static str = Box::leak(format!("/{}", feed_file_name()).into_boxed_str());
         let base = serve(vec![(name, feed.into_bytes()), ("/new.zip", payload.clone())]);
 
         let offer = check(&base).unwrap().expect("99.0.0 is newer");
@@ -316,7 +445,7 @@ mod tests {
             arch(),
             sha(b"something else entirely")
         );
-        let name: &'static str = Box::leak(format!("/latest-{}.json", platform()).into_boxed_str());
+        let name: &'static str = Box::leak(format!("/{}", feed_file_name()).into_boxed_str());
         let base = serve(vec![(name, feed.into_bytes()), ("/new.zip", payload)]);
         let offer = check(&base).unwrap().unwrap();
         let err = download(&offer, |_| {}).unwrap_err().to_string();
@@ -326,7 +455,7 @@ mod tests {
     #[test]
     fn no_update_when_the_feed_is_not_newer() {
         let feed = format!(r#"{{"version":"{CURRENT}","files":[]}}"#);
-        let name: &'static str = Box::leak(format!("/latest-{}.json", platform()).into_boxed_str());
+        let name: &'static str = Box::leak(format!("/{}", feed_file_name()).into_boxed_str());
         let base = serve(vec![(name, feed.into_bytes())]);
         assert!(check(&base).unwrap().is_none());
     }
@@ -347,7 +476,131 @@ mod tests {
             arch()
         );
         let feed: Feed = serde_json::from_str(&json).unwrap();
-        let file = feed.files.iter().find(|f| f.arch == arch()).unwrap();
+        let file = pick_file(&feed.files).unwrap();
         assert_eq!(file.url, "b.zip");
+    }
+
+    #[test]
+    fn without_a_file_for_this_architecture_the_first_one_is_used() {
+        let json = r#"{"version":"9.9.9","files":[{"arch":"other","url":"a.exe","sha512":"A"}]}"#;
+        let feed: Feed = serde_json::from_str(json).unwrap();
+        assert_eq!(pick_file(&feed.files).unwrap().url, "a.exe");
+        assert!(pick_file(&[]).is_none());
+    }
+
+    #[test]
+    fn each_system_reads_its_own_feed_file() {
+        let name = feed_file_name();
+        if cfg!(target_os = "macos") {
+            assert_eq!(name, "latest-mac.json");
+        } else if cfg!(windows) {
+            assert_eq!(name, "latest-win.json");
+        } else {
+            assert_eq!(name, "latest-linux.json");
+        }
+    }
+
+    #[test]
+    fn the_downloaded_file_is_named_after_its_extension() {
+        assert_eq!(download_name("https://x.test/native-updates/sdterm-native-1.0.0-mac-arm64.zip"), "update.zip");
+        assert_eq!(download_name("https://x.test/a/sdterm-native-1.0.0-win-x64-setup.exe"), "update.exe");
+        assert_eq!(download_name("https://x.test/a/sdterm-native-1.0.0-linux-x86_64.AppImage?token=1"), "update.AppImage");
+        assert_eq!(download_name("https://x.test/a/noextension"), "update.bin");
+        assert_eq!(download_name("https://x.test/a.b/noextension"), "update.bin");
+    }
+
+    #[test]
+    fn a_setup_and_an_appimage_are_downloaded_checked_and_named_for_what_they_are() {
+        for file in ["setup.exe", "app.AppImage"] {
+            let payload = format!("pretend this is {file}").into_bytes();
+            let feed = format!(
+                r#"{{"version":"99.0.0","files":[{{"arch":"{}","url":"{file}","sha512":"{}"}}]}}"#,
+                arch(),
+                sha(&payload)
+            );
+            let name: &'static str = Box::leak(format!("/{}", feed_file_name()).into_boxed_str());
+            let url_path: &'static str = Box::leak(format!("/{file}").into_boxed_str());
+            let base = serve(vec![(name, feed.into_bytes()), (url_path, payload.clone())]);
+            let offer = check(&base).unwrap().unwrap();
+            let path = download(&offer, |_| {}).unwrap();
+            assert_eq!(path.file_name().unwrap().to_string_lossy(), format!("update.{}", file.rsplit('.').next().unwrap()));
+            assert_eq!(std::fs::read(&path).unwrap(), payload);
+        }
+    }
+
+    #[test]
+    fn the_setup_is_started_silently_and_asked_to_reopen_the_app() {
+        assert_eq!(WINDOWS_SETUP_ARGS, ["/S", "/UPDATE"]);
+    }
+
+    #[test]
+    fn only_a_program_put_there_by_the_setup_updates_itself_in_place() {
+        let dir = std::env::temp_dir().join(format!("sdterm-installed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("sdterm-native.exe");
+        std::fs::write(&exe, b"x").unwrap();
+        assert!(!installed_by_setup(&exe), "a plain unzip has no uninstaller");
+        std::fs::write(dir.join("Uninstall.exe"), b"x").unwrap();
+        assert!(installed_by_setup(&exe));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_appimage_path_comes_from_the_environment_variable() {
+        assert_eq!(appimage_path(None), None);
+        assert_eq!(appimage_path(Some("".into())), None);
+        assert_eq!(appimage_path(Some("/home/me/sdterm.AppImage".into())), Some(PathBuf::from("/home/me/sdterm.AppImage")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_an_appimage_swaps_the_file_in_one_step_and_leaves_nothing_behind() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("sdterm-appimage-{}-{}", std::process::id(), fastrand::u32(..)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("sdterm-native.AppImage");
+        let new = dir.join("update.AppImage");
+        std::fs::write(&target, b"old version").unwrap();
+        std::fs::write(&new, b"new version").unwrap();
+        // A file someone else is still running from keeps its contents: simulate by holding it open.
+        let still_running = std::fs::File::open(&target).unwrap();
+
+        replace_file(&new, &target).unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"new version");
+        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o755);
+        let mut old = String::new();
+        let mut still_running = still_running;
+        still_running.read_to_string(&mut old).unwrap();
+        assert_eq!(old, "old version");
+        let mut names: Vec<String> =
+            std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["sdterm-native.AppImage", "update.AppImage"], "no staging file is left");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_cannot_be_written_gives_a_clear_error_and_keeps_the_old_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("sdterm-readonly-{}-{}", std::process::id(), fastrand::u32(..)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("sdterm-native.AppImage");
+        let new = std::env::temp_dir().join(format!("sdterm-new-{}-{}", std::process::id(), fastrand::u32(..)));
+        std::fs::write(&target, b"old version").unwrap();
+        std::fs::write(&new, b"new version").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = replace_file(&new, &target);
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Running as root ignores the permission; otherwise it must fail without touching the file.
+        if result.is_err() {
+            assert!(result.unwrap_err().to_string().contains("cannot write"));
+            assert_eq!(std::fs::read(&target).unwrap(), b"old version");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&new);
     }
 }
