@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Context, Entity, FocusHandle, Render, Subscription, Window, actions, div, px,
+    App, Context, Entity, FocusHandle, Render, Subscription, Window, actions, div, px,
 };
 use gpui_terminal::TerminalView;
 
@@ -28,6 +28,7 @@ use crate::theme::Theme;
 actions!(
     sdterm,
     [
+        NewWindow,
         NewTerminal,
         CloseTerminal,
         NewWorkspace,
@@ -51,6 +52,8 @@ pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 // ---- What the views need from the state ----------------------------------------------------
 
 pub(crate) struct Snapshot {
+    pub window_id: String,
+    pub open_windows: Vec<String>,
     pub sidebar_collapsed: bool,
     pub view: View,
     pub show_parked: bool,
@@ -73,6 +76,7 @@ pub(crate) struct Snapshot {
 impl Snapshot {
     fn take(
         state: &AppState,
+        window_id: &str,
         editor: Option<(Edit, Entity<TextInput>)>,
         setting_inputs: HashMap<&'static str, Entity<TextInput>>,
         window: &Window,
@@ -86,14 +90,16 @@ impl Snapshot {
             .map(|(id, _)| id.clone())
             .collect();
         Self {
-            sidebar_collapsed: state.sidebar_collapsed,
-            view: state.view,
+            window_id: window_id.to_string(),
+            sidebar_collapsed: state.collapsed_of(window_id),
+            view: state.view_of(window_id),
             show_parked: state.show_parked,
-            workspaces: state.mine().into_iter().cloned().collect(),
-            active: state.active().cloned(),
+            workspaces: state.mine_of(window_id).into_iter().cloned().collect(),
+            active: state.active_of(window_id).cloned(),
+            open_windows: state.open_windows.clone(),
             views,
             focused,
-            menu: state.menu.clone(),
+            menu: if state.menu_owner == window_id { state.menu.clone() } else { None },
             settings: state.data.settings.clone(),
             samples: state.resources.read(cx).samples.iter().copied().collect(),
             network_unit: state.data.settings.resources.network_unit,
@@ -109,6 +115,7 @@ impl Snapshot {
 
 pub struct Root {
     state: Entity<AppState>,
+    window_id: String,
     focus_subs: HashMap<String, Subscription>,
     editor: Option<(Edit, Entity<TextInput>, Subscription)>,
     setting_inputs: HashMap<&'static str, (Entity<TextInput>, Subscription)>,
@@ -117,11 +124,26 @@ pub struct Root {
 }
 
 impl Root {
-    pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+    pub fn new(state: Entity<AppState>, window_id: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let _observe = cx.observe(&state, |_, _, cx| cx.notify());
         let feed = state.read(cx).resources.clone();
         let _feed = cx.observe(&feed, |_, _, cx| cx.notify());
-        Self { state, focus_subs: HashMap::new(), editor: None, setting_inputs: HashMap::new(), _observe, _feed }
+        // Whichever window is in front is the one the menus and shortcuts act on.
+        let id = window_id.clone();
+        cx.observe_window_activation(window, move |this, window, cx| {
+            if window.is_window_active() {
+                this.mark_current(cx);
+            }
+        })
+        .detach();
+        let _ = id;
+        Self { state, window_id, focus_subs: HashMap::new(), editor: None, setting_inputs: HashMap::new(), _observe, _feed }
+    }
+
+    /// Makes this window the one actions apply to.
+    fn mark_current(&self, cx: &mut Context<Self>) {
+        let id = self.window_id.clone();
+        self.state.update(cx, |s, _| s.window_id = id);
     }
 
     /// Keeps the state in step with where the keyboard focus is, and moves it when asked.
@@ -145,7 +167,11 @@ impl Root {
             });
             self.focus_subs.insert(id.clone(), sub);
         }
-        let pending = self.state.update(cx, |state, _| state.pending_focus.take());
+        let me = self.window_id.clone();
+        let pending = self.state.update(cx, |state, _| match state.pending_focus.clone() {
+            Some(id) if state.pane_window(&id).as_deref() == Some(me.as_str()) => state.pending_focus.take(),
+            _ => None,
+        });
         if let Some(id) = pending {
             if let Some((_, handle)) = handles.iter().find(|(h, _)| *h == id) {
                 handle.focus(window);
@@ -155,7 +181,10 @@ impl Root {
 
     /// Creates the text field when something starts being edited, and drops it when it ends.
     fn sync_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let wanted = self.state.read(cx).editing.clone();
+        let wanted = {
+            let s = self.state.read(cx);
+            if s.edit_owner == self.window_id { s.editing.clone() } else { None }
+        };
         if self.editor.as_ref().map(|(e, _, _)| e) == wanted.as_ref() {
             return;
         }
@@ -196,7 +225,7 @@ impl Root {
         ];
         let (view, section, settings) = {
             let s = self.state.read(cx);
-            (s.view, s.settings_section, s.data.settings.clone())
+            (s.view_of(&self.window_id), s.settings_section, s.data.settings.clone())
         };
         if view != View::Settings || section != SettingsSection::Terminal {
             self.setting_inputs.clear();
@@ -269,7 +298,7 @@ impl Render for Root {
         let theme = cx.global::<Theme>().clone();
         let editor = self.editor.as_ref().map(|(e, i, _)| (e.clone(), i.clone()));
         let inputs = self.setting_inputs.iter().map(|(k, (i, _))| (*k, i.clone())).collect();
-        let snap = Snapshot::take(self.state.read(cx), editor, inputs, window, cx);
+        let snap = Snapshot::take(self.state.read(cx), &self.window_id, editor, inputs, window, cx);
         let state = self.state.clone();
 
         let mut root = div()
@@ -280,22 +309,29 @@ impl Render for Root {
             .text_color(theme.foreground)
             .font_family(UI_FONT)
             .text_size(px(13.))
+            .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.mark_current(cx)))
             .on_action(cx.listener(|this, _: &NewTerminal, _, cx| {
+                this.mark_current(cx);
                 this.state.update(cx, |s, cx| s.add_pane(cx))
             }))
             .on_action(cx.listener(|this, _: &NewWorkspace, _, cx| {
+                this.mark_current(cx);
                 this.state.update(cx, |s, cx| s.add_workspace(cx))
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
+                this.mark_current(cx);
                 this.state.update(cx, |s, cx| s.toggle_sidebar(cx))
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
+                this.mark_current(cx);
                 this.state.update(cx, |s, cx| {
-                    let next = if s.view == View::Settings { View::Terminals } else { View::Settings };
+                    let window = s.window_id.clone();
+                    let next = if s.view_of(&window) == View::Settings { View::Terminals } else { View::Settings };
                     s.set_view(next, cx)
                 })
             }))
             .on_action(cx.listener(|this, _: &CloseTerminal, _, cx| {
+                this.mark_current(cx);
                 this.state.update(cx, |s, cx| {
                     let pane = s.active().and_then(|w| w.active_pane_id.clone());
                     if let Some(pane) = pane {
@@ -311,5 +347,37 @@ impl Render for Root {
             root = root.child(sidebar::sidebar(&snap, &theme, &state));
         }
         root.child(panes::main_area(snap, &theme, &state))
+    }
+}
+
+/// Opens an app window showing the workspaces assigned to `window_id`.
+pub fn open_app_window(cx: &mut App, state: &Entity<AppState>, window_id: String) {
+    use gpui::{AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, size};
+    state.update(cx, |s, _| s.register_window(&window_id));
+    let options = WindowOptions {
+        titlebar: Some(TitlebarOptions {
+            title: Some("sdterm".into()),
+            appears_transparent: true,
+            traffic_light_position: Some(point(px(14.), px(14.))),
+        }),
+        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1280.), px(800.)), cx))),
+        ..Default::default()
+    };
+    let (root_state, id) = (state.clone(), window_id.clone());
+    let opened = cx.open_window(options, move |window, cx| {
+        let closing_state = root_state.clone();
+        let closing_id = id.clone();
+        window.on_window_should_close(cx, move |_window, cx| {
+            // The workspaces of a closed window carry on in another one; the last window ends the app.
+            let any_left = closing_state.update(cx, |s, cx| s.window_closed(&closing_id, cx));
+            if !any_left {
+                cx.quit();
+            }
+            true
+        });
+        cx.new(|cx| Root::new(root_state, id, window, cx))
+    });
+    if opened.is_err() {
+        eprintln!("could not open the window {window_id}");
     }
 }

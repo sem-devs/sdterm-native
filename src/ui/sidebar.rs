@@ -138,7 +138,8 @@ pub fn sidebar(snap: &Snapshot, theme: &Theme, state: &Entity<AppState>) -> AnyE
                 )
                 .child(icon_button("open-settings", "⚙", theme, move |cx| {
                     settings.update(cx, |s, cx| {
-                        let next = if s.view == View::Settings { View::Terminals } else { View::Settings };
+                        let window = s.window_id.clone();
+                        let next = if s.view_of(&window) == View::Settings { View::Terminals } else { View::Settings };
                         s.set_view(next, cx)
                     })
                 })),
@@ -156,7 +157,6 @@ fn workspace_item(
 ) -> AnyElement {
     let active = active_id == Some(ws.id.as_str());
     let (hover_bg, fg, muted) = (theme.accent.opacity(0.6), theme.foreground, theme.muted_foreground);
-    let ws_id = ws.id.clone();
     let renaming = snap
         .editor
         .as_ref()
@@ -241,6 +241,10 @@ fn workspace_item(
     row.into_any_element()
 }
 
+fn window_label(id: &str) -> String {
+    if id == "main" { "1".to_string() } else { id.trim_start_matches('w').to_string() }
+}
+
 fn workspace_menu(ws: &Workspace, snap: &Snapshot, theme: &Theme, state: &Entity<AppState>) -> AnyElement {
     let id = ws.id.clone();
     let mut panel = menu_panel(theme).top(px(30.)).right(px(4.)).w(px(220.));
@@ -310,6 +314,28 @@ fn workspace_menu(ws: &Workspace, snap: &Snapshot, theme: &Theme, state: &Entity
             s4.update(cx, |s, cx| s.close_menu(cx));
         }));
     }
+
+    // Move the workspace, with its running terminals, to another window.
+    let mut other: Vec<String> = snap.open_windows.iter().filter(|w| **w != snap.window_id).cloned().collect();
+    other.sort();
+    panel = panel.child(menu_separator(theme));
+    for (i, window) in other.iter().enumerate() {
+        let (st, wid, win) = (state.clone(), id.clone(), window.clone());
+        panel = panel.child(menu_item(("m-move", i), format!("Move to window {}", window_label(window)), theme, false, move |cx| {
+            st.update(cx, |s, cx| s.move_workspace(&wid, &win, cx))
+        }));
+    }
+    let st = state.clone();
+    let wid = id.clone();
+    panel = panel.child(menu_item("m-move-new", "Move to a new window", theme, false, move |cx| {
+        let window = st.update(cx, |s, cx| {
+            let window = s.new_window_id();
+            s.register_window(&window);
+            s.move_workspace(&wid, &window, cx);
+            window
+        });
+        super::open_app_window(cx, &st, window);
+    }));
 
     let s5 = state.clone();
     let del_id = id;

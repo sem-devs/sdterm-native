@@ -12,17 +12,14 @@ mod text_input;
 mod theme;
 mod ui;
 
-use gpui::{
-    App, AppContext, Application, Bounds, KeyBinding, Menu, MenuItem, TitlebarOptions, WindowAppearance,
-    WindowBounds, WindowOptions, point, px, size,
-};
+use gpui::{App, AppContext, Application, KeyBinding, Menu, MenuItem, WindowAppearance};
 
 use crate::state::AppState;
 use crate::theme::Theme;
 use crate::metrics::WidgetKind;
 use crate::ui::{
-    CloseTerminal, NewTerminal, NewWorkspace, OpenSettings, PopOutCpu, PopOutCpuRam, PopOutDisk,
-    PopOutNet, PopOutProcesses, PopOutRam, PopOutSummary, Quit, Root, ToggleSidebar,
+    CloseTerminal, NewTerminal, NewWindow, NewWorkspace, OpenSettings, PopOutCpu, PopOutCpuRam, PopOutDisk,
+    PopOutNet, PopOutProcesses, PopOutRam, PopOutSummary, Quit, ToggleSidebar,
 };
 
 fn main() {
@@ -41,11 +38,26 @@ fn main() {
             KeyBinding::new(&m("t"), NewTerminal, None),
             KeyBinding::new(&m("w"), CloseTerminal, None),
             KeyBinding::new(&m("n"), NewWorkspace, None),
+            KeyBinding::new(if cfg!(target_os = "macos") { "cmd-shift-n" } else { "ctrl-alt-n" }, NewWindow, None),
             KeyBinding::new(&m("b"), ToggleSidebar, None),
             KeyBinding::new(&m(","), OpenSettings, None),
             KeyBinding::new(&m("q"), Quit, None),
         ]);
-        cx.on_action(|_: &Quit, cx| cx.quit());
+        let quit_state = state.clone();
+        cx.on_action(move |_: &Quit, cx| {
+            quit_state.update(cx, |s, _| s.quitting = true);
+            cx.quit()
+        });
+        let window_state = state.clone();
+        cx.on_action(move |_: &NewWindow, cx| {
+            let id = window_state.update(cx, |s, cx| {
+                let id = s.new_window_id();
+                s.register_window(&id);
+                s.add_workspace_in(&id, cx);
+                id
+            });
+            crate::ui::open_app_window(cx, &window_state, id);
+        });
         macro_rules! pop_out {
             ($($action:ident => $kind:expr),* $(,)?) => {$(
                 let st = state.clone();
@@ -77,6 +89,7 @@ fn main() {
                     MenuItem::action("Close Terminal", CloseTerminal),
                     MenuItem::separator(),
                     MenuItem::action("New Workspace", NewWorkspace),
+                    MenuItem::action("New Window", NewWindow),
                 ],
             },
             Menu {
@@ -107,22 +120,11 @@ fn main() {
         })
         .detach();
 
-        let options = WindowOptions {
-            titlebar: Some(TitlebarOptions {
-                title: Some("sdterm".into()),
-                appears_transparent: true,
-                traffic_light_position: Some(point(px(14.), px(14.))),
-            }),
-            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                None,
-                size(px(1280.), px(800.)),
-                cx,
-            ))),
-            ..Default::default()
-        };
-        let root_state = state.clone();
-        cx.open_window(options, move |_window, cx| cx.new(|cx| Root::new(root_state, cx)))
-            .expect("could not open the window");
+        // One window for each window the saved workspaces belong to.
+        let ids = state.read(cx).window_ids();
+        for id in ids {
+            crate::ui::open_app_window(cx, &state, id);
+        }
         cx.activate(true);
     });
 }

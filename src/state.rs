@@ -65,16 +65,25 @@ pub enum Menu {
 
 pub struct AppState {
     pub data: StoreData,
-    /// This window's id: "main", "w2", ...
+    /// The window the user is working in: "main", "w2", ... Actions apply to it.
     pub window_id: String,
+    /// The app windows that are open.
+    pub open_windows: Vec<String>,
+    /// Set when the app is quitting, so closing the windows does not shuffle workspaces around.
+    pub quitting: bool,
+    /// Which window opened the menu or the editor that is open.
+    pub menu_owner: String,
+    pub edit_owner: String,
     /// The running shells, by terminal id.
     pub sessions: HashMap<String, Session>,
-    pub view: View,
+    /// What each window shows.
+    pub views: HashMap<String, View>,
+    /// The windows whose sidebar is hidden.
+    pub collapsed: HashSet<String>,
     pub resources: Entity<ResourceFeed>,
     /// The pop-out windows that are open.
     pub widgets: HashMap<WidgetKind, AnyWindowHandle>,
     pub settings_section: SettingsSection,
-    pub sidebar_collapsed: bool,
     pub show_parked: bool,
     pub confirm_reset: bool,
     pub editing: Option<Edit>,
@@ -152,12 +161,16 @@ impl AppState {
         let mut state = Self {
             data,
             window_id,
+            open_windows: vec!["main".to_string()],
+            quitting: false,
+            menu_owner: String::new(),
+            edit_owner: String::new(),
             sessions: HashMap::new(),
-            view: View::Terminals,
+            views: HashMap::new(),
+            collapsed: HashSet::new(),
             resources,
             widgets: HashMap::new(),
             settings_section: SettingsSection::Appearance,
-            sidebar_collapsed: false,
             show_parked: false,
             confirm_reset: false,
             editing: None,
@@ -194,35 +207,63 @@ impl AppState {
         self.all().iter().find(|w| w.id == id)
     }
 
-    /// The workspaces shown in this window.
-    pub fn mine(&self) -> Vec<&Workspace> {
-        self.all().iter().filter(|w| w.window_id == self.window_id).collect()
+    /// The workspaces of a window.
+    pub fn mine_of(&self, window: &str) -> Vec<&Workspace> {
+        self.all().iter().filter(|w| w.window_id == window).collect()
     }
 
-    pub fn active_id(&self) -> Option<String> {
+    /// The workspaces of the window the user is working in.
+    pub fn mine(&self) -> Vec<&Workspace> {
+        self.mine_of(&self.window_id)
+    }
+
+    pub fn view_of(&self, window: &str) -> View {
+        self.views.get(window).copied().unwrap_or(View::Terminals)
+    }
+
+    pub fn collapsed_of(&self, window: &str) -> bool {
+        self.collapsed.contains(window)
+    }
+
+    /// The window a terminal is shown in.
+    pub fn pane_window(&self, pane_id: &str) -> Option<String> {
+        self.find_pane(pane_id).map(|(w, _)| w.window_id.clone())
+    }
+
+    pub fn active_id_of(&self, window: &str) -> Option<String> {
         let picked = self
             .data
             .workspaces
             .as_ref()
-            .and_then(|w| w.active_by_window.get(&self.window_id))
-            .filter(|id| self.mine().iter().any(|w| &w.id == *id))
+            .and_then(|w| w.active_by_window.get(window))
+            .filter(|id| self.mine_of(window).iter().any(|w| &w.id == *id))
             .cloned();
-        picked.or_else(|| self.mine().first().map(|w| w.id.clone()))
+        picked.or_else(|| self.mine_of(window).first().map(|w| w.id.clone()))
     }
 
-    pub fn active(&self) -> Option<&Workspace> {
-        let id = self.active_id()?;
+    pub fn active_of(&self, window: &str) -> Option<&Workspace> {
+        let id = self.active_id_of(window)?;
         self.ws(&id)
     }
 
+    pub fn active_id(&self) -> Option<String> {
+        self.active_id_of(&self.window_id)
+    }
+
+    pub fn active(&self) -> Option<&Workspace> {
+        self.active_of(&self.window_id)
+    }
+
     fn ensure_active_exists(&mut self) {
-        if let Some(id) = self.active_id() {
-            let window = self.window_id.clone();
-            self.data
-                .workspaces
-                .get_or_insert_with(Default::default)
-                .active_by_window
-                .insert(window, id);
+        let windows: Vec<String> = self.all().iter().map(|w| w.window_id.clone()).collect::<HashSet<_>>().into_iter().collect();
+        for window in windows {
+            if let Some(id) = self.active_id_of(&window) {
+                self.data
+                    .workspaces
+                    .get_or_insert_with(Default::default)
+                    .active_by_window
+                    .insert(window, id);
+            }
         }
     }
 
@@ -248,8 +289,8 @@ impl AppState {
     /// Starts a shell for every terminal of a running workspace of this window that has none.
     pub fn ensure_sessions(&mut self, cx: &mut Context<Self>) {
         let wanted: Vec<(String, PathBuf)> = self
-            .mine()
-            .into_iter()
+            .all()
+            .iter()
             .filter(|w| !w.parked)
             .flat_map(|w| w.panes.iter().map(move |p| (w, p)))
             .filter(|(_, p)| !self.sessions.contains_key(&p.id))
@@ -358,7 +399,7 @@ impl AppState {
     // ---- Workspaces ---------------------------------------------------------------------
 
     pub fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
-        self.view = view;
+        self.views.insert(self.window_id.clone(), view);
         cx.notify();
     }
 
@@ -404,12 +445,15 @@ impl AppState {
     }
 
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
-        self.sidebar_collapsed = !self.sidebar_collapsed;
+        if !self.collapsed.remove(&self.window_id) {
+            self.collapsed.insert(self.window_id.clone());
+        }
         cx.notify();
     }
 
     pub fn begin_edit(&mut self, edit: Edit, cx: &mut Context<Self>) {
         self.menu = None;
+        self.edit_owner = self.window_id.clone();
         self.editing = Some(edit);
         cx.notify();
     }
@@ -428,11 +472,13 @@ impl AppState {
 
     pub fn toggle_menu(&mut self, menu: Menu, cx: &mut Context<Self>) {
         self.editing = None;
+        self.menu_owner = self.window_id.clone();
         self.menu = if self.menu.as_ref() == Some(&menu) { None } else { Some(menu) };
         cx.notify();
     }
 
     pub fn open_menu(&mut self, menu: Menu, cx: &mut Context<Self>) {
+        self.menu_owner = self.window_id.clone();
         self.menu = Some(menu);
         cx.notify();
     }
@@ -466,7 +512,7 @@ impl AppState {
             .get_or_insert_with(Default::default)
             .active_by_window
             .insert(window, id.to_string());
-        self.view = View::Terminals;
+        self.views.insert(self.window_id.clone(), View::Terminals);
         self.menu = None;
         if let Some(pane) = self.ws(id).and_then(|w| w.active_pane_id.clone()) {
             self.pending_focus = Some(pane);
@@ -558,6 +604,90 @@ impl AppState {
         }
     }
 
+    /// The windows the saved workspaces belong to, "main" first.
+    pub fn window_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.all().iter().map(|w| w.window_id.clone()).collect::<HashSet<_>>().into_iter().collect();
+        ids.sort_by_key(|id| (id != "main", id.clone()));
+        if ids.is_empty() {
+            ids.push("main".to_string());
+        }
+        ids
+    }
+
+    // ---- Windows ------------------------------------------------------------------------
+
+    /// The next free window id: w2, w3, ...
+    pub fn new_window_id(&self) -> String {
+        (2..).map(|n| format!("w{n}")).find(|id| !self.open_windows.contains(id)).unwrap()
+    }
+
+    pub fn register_window(&mut self, window: &str) {
+        if !self.open_windows.iter().any(|w| w == window) {
+            self.open_windows.push(window.to_string());
+        }
+    }
+
+    /// Gives a window its own first workspace, with a terminal in it.
+    pub fn add_workspace_in(&mut self, window: &str, cx: &mut Context<Self>) {
+        let n = self.all().len() + 1;
+        let mut ws = Workspace::new(format!("Workspace {n}"), window);
+        let pane = self.new_pane_for(&ws);
+        ws.active_pane_id = Some(pane.id.clone());
+        ws.panes.push(pane);
+        let id = ws.id.clone();
+        self.all_mut().push(ws);
+        self.ensure_sessions(cx);
+        self.data
+            .workspaces
+            .get_or_insert_with(Default::default)
+            .active_by_window
+            .insert(window.to_string(), id);
+        self.changed(cx);
+    }
+
+    /// Moves a workspace, shells and all, to another window.
+    pub fn move_workspace(&mut self, id: &str, window: &str, cx: &mut Context<Self>) {
+        let Some(from) = self.ws(id).map(|w| w.window_id.clone()) else { return };
+        if from == window {
+            return;
+        }
+        if let Some(ws) = self.ws_mut(id) {
+            ws.window_id = window.to_string();
+        }
+        self.menu = None;
+        self.ensure_active_exists();
+        self.data
+            .workspaces
+            .get_or_insert_with(Default::default)
+            .active_by_window
+            .insert(window.to_string(), id.to_string());
+        self.pending_focus = self.ws(id).and_then(|w| w.active_pane_id.clone());
+        self.changed(cx);
+    }
+
+    /// A window was closed: its workspaces keep running in another window. Returns whether any
+    /// window is left.
+    pub fn window_closed(&mut self, window: &str, cx: &mut Context<Self>) -> bool {
+        self.open_windows.retain(|w| w != window);
+        self.views.remove(window);
+        self.collapsed.remove(window);
+        if self.quitting {
+            return !self.open_windows.is_empty();
+        }
+        if let Some(target) = self.open_windows.first().cloned() {
+            let moving: Vec<String> =
+                self.mine_of(window).iter().map(|w| w.id.clone()).collect();
+            for id in moving {
+                if let Some(ws) = self.ws_mut(&id) {
+                    ws.window_id = target.clone();
+                }
+            }
+            self.ensure_active_exists();
+            self.changed(cx);
+        }
+        !self.open_windows.is_empty()
+    }
+
     // ---- Terminals ----------------------------------------------------------------------
 
     /// A new terminal: the first color of the palette not used in the workspace yet.
@@ -630,17 +760,20 @@ impl AppState {
     /// Selects a terminal from anywhere (the sidebar, a click): shows its workspace, makes it the
     /// active one there and asks for the keyboard focus to move to it.
     pub fn focus_pane_and_select(&mut self, pane_id: &str, cx: &mut Context<Self>) {
-        let Some(ws_id) = self.find_pane(pane_id).map(|(w, _)| w.id.clone()) else { return };
-        let window = self.window_id.clone();
+        let Some((ws_id, window)) =
+            self.find_pane(pane_id).map(|(w, _)| (w.id.clone(), w.window_id.clone()))
+        else {
+            return;
+        };
         self.data
             .workspaces
             .get_or_insert_with(Default::default)
             .active_by_window
-            .insert(window, ws_id.clone());
+            .insert(window.clone(), ws_id.clone());
         if let Some(ws) = self.ws_mut(&ws_id) {
             ws.active_pane_id = Some(pane_id.to_string());
         }
-        self.view = View::Terminals;
+        self.views.insert(window, View::Terminals);
         self.pending_focus = Some(pane_id.to_string());
         self.changed(cx);
     }
