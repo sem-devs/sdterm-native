@@ -450,185 +450,249 @@ impl TerminalRenderer {
         bounds: Bounds<Pixels>,
         padding: Edges<Pixels>,
         term: &Term<GpuiEventProxy>,
+        focused: bool,
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) {
-        // Get terminal dimensions
+        use alacritty_terminal::term::TermMode;
+        use alacritty_terminal::vte::ansi::{CursorShape, NamedColor};
+
         let grid = term.grid();
         let num_lines = grid.screen_lines();
         let num_cols = grid.columns();
         let colors = term.colors();
+        // How far the view is scrolled back into the history (0 = at the bottom).
+        let offset = grid.display_offset() as i32;
 
-        // Calculate default background color
-        let default_bg = self.palette.resolve(
-            Color::Named(alacritty_terminal::vte::ansi::NamedColor::Background),
-            colors,
-        );
+        let default_bg = self.palette.resolve(Color::Named(NamedColor::Background), colors);
+        let cursor_color = self.palette.resolve(Color::Named(NamedColor::Cursor), colors);
+        let mut selection_color = cursor_color;
+        selection_color.a = 0.35;
 
-        // Paint default background (covers full bounds including padding)
-        window.paint_quad(quad(
-            bounds,
-            px(0.0),
-            default_bg,
-            Edges::<Pixels>::default(),
-            transparent_black(),
-            Default::default(),
-        ));
+        let fill = |window: &mut Window, rect: Bounds<Pixels>, color: Hsla| {
+            window.paint_quad(quad(
+                rect,
+                px(0.0),
+                color,
+                Edges::<Pixels>::default(),
+                transparent_black(),
+                Default::default(),
+            ));
+        };
 
-        // Calculate origin offset (content starts after padding)
+        // Default background (covers full bounds including padding)
+        fill(window, bounds, default_bg);
+
         let origin = Point {
             x: bounds.origin.x + padding.left,
             y: bounds.origin.y + padding.top,
         };
+        let selection = term.selection.as_ref().and_then(|s| s.to_range(term));
 
-        // Iterate over visible lines
+        // The text sits in the middle of the taller cell the line height multiplier makes.
+        let base_height = self.cell_height / self.line_height_multiplier;
+        let vertical_offset = (self.cell_height - base_height) / 2.0;
+        let thin = px(1.0);
+
         for line_idx in 0..num_lines {
-            let line = Line(line_idx as i32);
+            let line = Line(line_idx as i32 - offset);
+            let y = origin.y + self.cell_height * (line_idx as f32);
 
-            // Collect cells for this line
-            let cells: Vec<(usize, Cell)> = (0..num_cols)
+            // The look of every cell of the row: reverse video swaps the colors, dim fades the text.
+            let cells: Vec<(char, Hsla, Hsla, Flags, bool)> = (0..num_cols)
                 .map(|col_idx| {
-                    let col = Column(col_idx);
-                    let point = AlacPoint::new(line, col);
-                    let cell = grid[point].clone();
-                    (col_idx, cell)
+                    let point = AlacPoint::new(line, Column(col_idx));
+                    let cell = &grid[point];
+                    let mut fg = self.palette.resolve(cell.fg, colors);
+                    let mut bg = self.palette.resolve(cell.bg, colors);
+                    if cell.flags.contains(Flags::INVERSE) {
+                        std::mem::swap(&mut fg, &mut bg);
+                    }
+                    if cell.flags.contains(Flags::DIM) {
+                        fg.a *= 0.6;
+                    }
+                    let selected = selection.as_ref().is_some_and(|range| range.contains(point));
+                    (cell.c, fg, bg, cell.flags, selected)
                 })
                 .collect();
 
-            // Layout the row for backgrounds
-            let (backgrounds, _) = self.layout_row(line_idx, cells.iter().cloned(), colors);
-
-            // Paint backgrounds
-            for bg_rect in backgrounds {
-                // Skip if it's the default background color
-                if bg_rect.color == default_bg {
-                    continue;
+            // Backgrounds, merging neighbours that share a color.
+            let mut col = 0;
+            while col < num_cols {
+                let bg = cells[col].2;
+                let mut end = col + 1;
+                while end < num_cols && cells[end].2 == bg {
+                    end += 1;
                 }
-
-                let x = origin.x + self.cell_width * (bg_rect.start_col as f32);
-                let y = origin.y + self.cell_height * (bg_rect.row as f32);
-                let width = self.cell_width * ((bg_rect.end_col - bg_rect.start_col) as f32);
-                let height = self.cell_height;
-
-                let rect_bounds = Bounds {
-                    origin: Point { x, y },
-                    size: Size { width, height },
-                };
-
-                window.paint_quad(quad(
-                    rect_bounds,
-                    px(0.0),
-                    bg_rect.color,
-                    Edges::<Pixels>::default(),
-                    transparent_black(),
-                    Default::default(),
-                ));
+                if bg != default_bg {
+                    fill(
+                        window,
+                        Bounds {
+                            origin: Point { x: origin.x + self.cell_width * (col as f32), y },
+                            size: Size {
+                                width: self.cell_width * ((end - col) as f32),
+                                height: self.cell_height,
+                            },
+                        },
+                        bg,
+                    );
+                }
+                col = end;
             }
 
-            // Calculate vertical offset to center text in cell
-            // The multiplier adds extra height; we want to distribute it evenly top/bottom
-            let base_height = self.cell_height / self.line_height_multiplier;
-            let vertical_offset = (self.cell_height - base_height) / 2.0;
-
-            // Paint each character individually at exact cell positions
-            // This ensures perfect alignment for terminal emulation
-            for (col_idx, cell) in cells {
-                let ch = cell.c;
-
-                // Skip empty cells (space or null)
-                if ch == ' ' || ch == '\0' {
+            // The selection, over the backgrounds and under the text.
+            let mut col = 0;
+            while col < num_cols {
+                if !cells[col].4 {
+                    col += 1;
                     continue;
                 }
+                let mut end = col + 1;
+                while end < num_cols && cells[end].4 {
+                    end += 1;
+                }
+                fill(
+                    window,
+                    Bounds {
+                        origin: Point { x: origin.x + self.cell_width * (col as f32), y },
+                        size: Size {
+                            width: self.cell_width * ((end - col) as f32),
+                            height: self.cell_height,
+                        },
+                    },
+                    selection_color,
+                );
+                col = end;
+            }
 
+            // The characters, each at its exact cell so the columns always line up.
+            for (col_idx, (ch, fg, _bg, flags, _selected)) in cells.iter().enumerate() {
+                if flags.contains(Flags::WIDE_CHAR_SPACER) || flags.contains(Flags::HIDDEN) {
+                    continue;
+                }
                 let x = origin.x + self.cell_width * (col_idx as f32);
-                let y = origin.y + self.cell_height * (line_idx as f32) + vertical_offset;
+                let width = self.cell_width * if flags.contains(Flags::WIDE_CHAR) { 2.0 } else { 1.0 };
 
-                // Get cell colors
-                let fg_color = self.palette.resolve(cell.fg, colors);
+                if *ch != ' ' && *ch != '\0' {
+                    let font = Font {
+                        family: self.font_family.clone().into(),
+                        features: FontFeatures::default(),
+                        fallbacks: None,
+                        weight: if flags.contains(Flags::BOLD) { FontWeight::BOLD } else { FontWeight::NORMAL },
+                        style: if flags.contains(Flags::ITALIC) { FontStyle::Italic } else { FontStyle::Normal },
+                    };
+                    let text: SharedString = ch.to_string().into();
+                    let run = TextRun {
+                        len: text.len(),
+                        font,
+                        color: *fg,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    let shaped = window.text_system().shape_line(text, self.font_size, &[run], None);
+                    let _ = shaped.paint(Point { x, y: y + vertical_offset - vertical_offset }, self.cell_height, window, cx);
+                }
 
-                // Get cell flags for styling
-                let flags = cell.flags;
-                let bold = flags.contains(alacritty_terminal::term::cell::Flags::BOLD);
-                let italic = flags.contains(alacritty_terminal::term::cell::Flags::ITALIC);
-                let underline = flags.contains(alacritty_terminal::term::cell::Flags::UNDERLINE);
-
-                // Create font with styling
-                let font = Font {
-                    family: self.font_family.clone().into(),
-                    features: FontFeatures::default(),
-                    fallbacks: None,
-                    weight: if bold {
-                        FontWeight::BOLD
-                    } else {
-                        FontWeight::NORMAL
-                    },
-                    style: if italic {
-                        FontStyle::Italic
-                    } else {
-                        FontStyle::Normal
-                    },
-                };
-
-                // Create text run for this single character
-                let char_str = ch.to_string();
-                let text_run = TextRun {
-                    len: char_str.len(),
-                    font,
-                    color: fg_color,
-                    background_color: None,
-                    underline: if underline {
-                        Some(UnderlineStyle {
-                            thickness: px(1.0),
-                            color: Some(fg_color),
-                            wavy: false,
-                        })
-                    } else {
-                        None
-                    },
-                    strikethrough: None,
-                };
-
-                // Shape and paint the character
-                let text: SharedString = char_str.into();
-                let shaped_line =
-                    window
-                        .text_system()
-                        .shape_line(text, self.font_size, &[text_run], None);
-
-                // Paint at exact cell position (ignore errors)
-                let _ = shaped_line.paint(Point { x, y }, self.cell_height, window, _cx);
+                let underlined = flags.intersects(
+                    Flags::UNDERLINE
+                        | Flags::DOUBLE_UNDERLINE
+                        | Flags::UNDERCURL
+                        | Flags::DOTTED_UNDERLINE
+                        | Flags::DASHED_UNDERLINE,
+                );
+                if underlined {
+                    fill(
+                        window,
+                        Bounds {
+                            origin: Point { x, y: y + self.cell_height - px(2.0) },
+                            size: Size { width, height: thin },
+                        },
+                        *fg,
+                    );
+                }
+                if flags.contains(Flags::STRIKEOUT) {
+                    fill(
+                        window,
+                        Bounds {
+                            origin: Point { x, y: y + self.cell_height / 2.0 },
+                            size: Size { width, height: thin },
+                        },
+                        *fg,
+                    );
+                }
             }
         }
 
-        // Paint cursor
-        let cursor_point = grid.cursor.point;
-        let cursor_x = origin.x + self.cell_width * (cursor_point.column.0 as f32);
-        let cursor_y = origin.y + self.cell_height * (cursor_point.line.0 as f32);
-
-        let cursor_color = self.palette.resolve(
-            Color::Named(alacritty_terminal::vte::ansi::NamedColor::Cursor),
-            colors,
-        );
-
-        let cursor_bounds = Bounds {
-            origin: Point {
-                x: cursor_x,
-                y: cursor_y,
-            },
-            size: Size {
-                width: self.cell_width,
-                height: self.cell_height,
-            },
-        };
-
-        window.paint_quad(quad(
-            cursor_bounds,
-            px(0.0),
-            cursor_color,
-            Edges::<Pixels>::default(),
-            transparent_black(),
-            Default::default(),
-        ));
+        // The cursor: solid when the terminal has the keyboard focus, an outline when it does not.
+        let cursor = grid.cursor.point;
+        let visible = term.mode().contains(TermMode::SHOW_CURSOR) && offset == 0;
+        let row = cursor.line.0;
+        if visible && row >= 0 && (row as usize) < num_lines {
+            let shape = term.cursor_style().shape;
+            if shape != CursorShape::Hidden {
+                let cell = &grid[cursor];
+                let wide = cell.flags.contains(Flags::WIDE_CHAR);
+                let cursor_bounds = Bounds {
+                    origin: Point {
+                        x: origin.x + self.cell_width * (cursor.column.0 as f32),
+                        y: origin.y + self.cell_height * (row as f32),
+                    },
+                    size: Size {
+                        width: self.cell_width * if wide { 2.0 } else { 1.0 },
+                        height: self.cell_height,
+                    },
+                };
+                let line_width = px(2.0);
+                if !focused || shape == CursorShape::HollowBlock {
+                    for edge in [
+                        Bounds { origin: cursor_bounds.origin, size: Size { width: cursor_bounds.size.width, height: thin } },
+                        Bounds {
+                            origin: Point { x: cursor_bounds.origin.x, y: cursor_bounds.origin.y + cursor_bounds.size.height - thin },
+                            size: Size { width: cursor_bounds.size.width, height: thin },
+                        },
+                        Bounds { origin: cursor_bounds.origin, size: Size { width: thin, height: cursor_bounds.size.height } },
+                        Bounds {
+                            origin: Point { x: cursor_bounds.origin.x + cursor_bounds.size.width - thin, y: cursor_bounds.origin.y },
+                            size: Size { width: thin, height: cursor_bounds.size.height },
+                        },
+                    ] {
+                        fill(window, edge, cursor_color);
+                    }
+                } else if shape == CursorShape::Underline {
+                    fill(
+                        window,
+                        Bounds {
+                            origin: Point { x: cursor_bounds.origin.x, y: cursor_bounds.origin.y + cursor_bounds.size.height - line_width },
+                            size: Size { width: cursor_bounds.size.width, height: line_width },
+                        },
+                        cursor_color,
+                    );
+                } else if shape == CursorShape::Beam {
+                    fill(
+                        window,
+                        Bounds { origin: cursor_bounds.origin, size: Size { width: line_width, height: cursor_bounds.size.height } },
+                        cursor_color,
+                    );
+                } else {
+                    // A block: solid, with the character under it drawn in the background color.
+                    fill(window, cursor_bounds, cursor_color);
+                    if cell.c != ' ' && cell.c != '\0' && !cell.flags.contains(Flags::HIDDEN) {
+                        let font = Font {
+                            family: self.font_family.clone().into(),
+                            features: FontFeatures::default(),
+                            fallbacks: None,
+                            weight: if cell.flags.contains(Flags::BOLD) { FontWeight::BOLD } else { FontWeight::NORMAL },
+                            style: if cell.flags.contains(Flags::ITALIC) { FontStyle::Italic } else { FontStyle::Normal },
+                        };
+                        let text: SharedString = cell.c.to_string().into();
+                        let run = TextRun { len: text.len(), font, color: default_bg, background_color: None, underline: None, strikethrough: None };
+                        let shaped = window.text_system().shape_line(text, self.font_size, &[run], None);
+                        let _ = shaped.paint(cursor_bounds.origin, self.cell_height, window, cx);
+                    }
+                }
+            }
+        }
     }
 
     /// Draws text the system input method is still composing (what dictation has heard so far, or

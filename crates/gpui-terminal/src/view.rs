@@ -372,6 +372,15 @@ pub type ExitCallback = Box<dyn Fn(&mut Window, &mut Context<TerminalView>)>;
 ///
 /// `TerminalView` is not `Send` as it contains GPUI handles. The stdin writer
 /// is internally wrapped in `Arc<parking_lot::Mutex<>>` for safe concurrent access.
+/// Where the terminal was last painted and how big its cells are, so the mouse can find the cell
+/// under the pointer.
+#[derive(Clone, Copy, Default)]
+struct PaintInfo {
+    origin: Point<Pixels>,
+    cell_width: Pixels,
+    cell_height: Pixels,
+}
+
 pub struct TerminalView {
     /// The terminal state managing the grid and VTE parser
     state: TerminalState,
@@ -398,6 +407,18 @@ pub struct TerminalView {
     /// Option acts as Meta (ESC prefix) instead of typing characters. Off by default, like
     /// Terminal.app, so Option+key types @ # [ ] and accents on Italian and other layouts.
     option_as_meta: bool,
+
+    /// Where the terminal was last painted (shared with the paint closure).
+    paint_info: Arc<parking_lot::Mutex<PaintInfo>>,
+
+    /// A mouse selection is being dragged.
+    selecting: bool,
+
+    /// Pixels scrolled by the wheel that did not add up to a whole line yet.
+    scroll_accum: f32,
+
+    /// Copy the selection to the clipboard as soon as it is made.
+    copy_on_select: bool,
 
     /// Async task that reads bytes and notifies the view (push-based)
     #[allow(dead_code)]
@@ -536,6 +557,10 @@ impl TerminalView {
             config,
             marked_text: None,
             option_as_meta: false,
+            paint_info: Arc::new(parking_lot::Mutex::new(PaintInfo::default())),
+            selecting: false,
+            scroll_accum: 0.0,
+            copy_on_select: false,
             _reader_task: reader_task,
             resize_callback: None,
             key_handler: None,
@@ -544,6 +569,12 @@ impl TerminalView {
             clipboard_store_callback: None,
             exit_callback: None,
         }
+    }
+
+    /// Copy the selection to the clipboard as soon as it is made.
+    pub fn with_copy_on_select(mut self, on: bool) -> Self {
+        self.copy_on_select = on;
+        self
     }
 
     /// Make Option act as Meta (sends ESC before the key) instead of typing characters.
@@ -745,6 +776,26 @@ impl TerminalView {
         // result to `replace_text_in_range`. Writing them here too would type everything twice.
         let ks = &event.keystroke;
         let m = &ks.modifiers;
+        // Copy and paste: Cmd+C / Cmd+V on a Mac, Ctrl+Shift+C / V elsewhere (plain Ctrl+C is
+        // the interrupt and must reach the shell).
+        let chord = |key: &str| {
+            ks.key == key
+                && if cfg!(target_os = "macos") {
+                    m.platform && !m.shift && !m.control && !m.alt
+                } else {
+                    m.control && m.shift && !m.alt
+                }
+        };
+        if chord("c") {
+            self.copy_selection(_cx);
+            _cx.stop_propagation();
+            return;
+        }
+        if chord("v") {
+            self.paste_clipboard(_cx);
+            _cx.stop_propagation();
+            return;
+        }
         let types_text = ks.key_char.is_some()
             && !m.control
             && !m.platform
@@ -755,6 +806,7 @@ impl TerminalView {
         }
 
         if let Some(bytes) = keystroke_to_bytes(&event.keystroke, self.state.mode()) {
+            self.on_user_input();
             self.write_to_shell(&bytes);
             _cx.stop_propagation(); // handled: do not feed it to the input method as well
         }
@@ -795,66 +847,216 @@ impl TerminalView {
         }
     }
 
-    /// Handle mouse down events.
-    ///
-    /// Currently a placeholder for future mouse selection and interaction support.
-    fn on_mouse_down(
-        &mut self,
-        _event: &MouseDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        // Request focus when clicking the terminal
+    /// Typing, pasting or any key that reaches the shell: jump back to the bottom of the output
+    /// and drop the selection, like every terminal.
+    fn on_user_input(&mut self) {
+        use alacritty_terminal::grid::Scroll;
+        let term = self.state.term_arc();
+        let mut term = term.lock();
+        term.scroll_display(Scroll::Bottom);
+        term.selection = None;
+    }
+
+    /// Copies the selected text to the clipboard.
+    fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        let text = self.state.term_arc().lock().selection_to_string();
+        if let Some(text) = text.filter(|t| !t.is_empty()) {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    /// Pastes the clipboard. Programs that ask for it get the text marked as a paste, so an editor
+    /// does not treat it as typing.
+    fn paste_clipboard(&mut self, cx: &mut Context<Self>) {
+        use alacritty_terminal::term::TermMode;
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else { return };
+        if text.is_empty() {
+            return;
+        }
+        self.on_user_input();
+        let mut text = text.replace("\r\n", "\r").replace('\n', "\r");
+        let mut bytes = Vec::new();
+        if self.state.mode().contains(TermMode::BRACKETED_PASTE) {
+            // Never let the pasted text end the paste early.
+            text = text.replace("\x1b[201~", "");
+            bytes.extend_from_slice(b"\x1b[200~");
+            bytes.extend_from_slice(text.as_bytes());
+            bytes.extend_from_slice(b"\x1b[201~");
+        } else {
+            bytes.extend_from_slice(text.as_bytes());
+        }
+        self.write_to_shell(&bytes);
+    }
+
+    /// The grid cell under a pixel position, and which half of the cell it is in.
+    fn grid_point(
+        &self,
+        position: Point<Pixels>,
+    ) -> (alacritty_terminal::index::Point, alacritty_terminal::index::Side) {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::{Column, Line, Point as AlacPoint, Side};
+        let info = *self.paint_info.lock();
+        let term = self.state.term_arc();
+        let term = term.lock();
+        let (cols, rows) = (term.columns() as f32, term.screen_lines() as f32);
+        let offset = term.grid().display_offset() as i32;
+        let cell_w: f32 = info.cell_width.into();
+        let cell_h: f32 = info.cell_height.into();
+        if cell_w <= 0.0 || cell_h <= 0.0 {
+            return (AlacPoint::new(Line(0), Column(0)), Side::Left);
+        }
+        let x: f32 = (position.x - info.origin.x).into();
+        let y: f32 = (position.y - info.origin.y).into();
+        let col = (x / cell_w).floor().clamp(0.0, cols - 1.0);
+        let row = (y / cell_h).floor().clamp(0.0, rows - 1.0);
+        let side = if x - col * cell_w < cell_w / 2.0 { Side::Left } else { Side::Right };
+        (AlacPoint::new(Line(row as i32 - offset), Column(col as usize)), side)
+    }
+
+    /// The point as the cell on screen, for reports to programs that track the mouse.
+    fn screen_point(&self, point: alacritty_terminal::index::Point) -> alacritty_terminal::index::Point {
+        let offset = self.state.term_arc().lock().grid().display_offset() as i32;
+        alacritty_terminal::index::Point::new(
+            alacritty_terminal::index::Line(point.line.0 + offset),
+            point.column,
+        )
+    }
+
+    fn tracks_mouse(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.state.mode().intersects(
+            TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_MOTION | TermMode::MOUSE_DRAG,
+        )
+    }
+
+    /// Handle mouse down events: a click focuses the terminal and starts a selection, or goes to
+    /// the program when it asks for the mouse (hold Shift to select anyway).
+    fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        use alacritty_terminal::selection::{Selection, SelectionType};
         window.focus(&self.focus_handle);
+        let (point, side) = self.grid_point(event.position);
+
+        if self.tracks_mouse() && !event.modifiers.shift {
+            let mods = crate::mouse::encode_modifiers(false, event.modifiers.alt, event.modifiers.control);
+            let screen = self.screen_point(point);
+            if let Some(bytes) = crate::mouse::mouse_button_report(
+                MouseButton::Left,
+                true,
+                screen,
+                mods,
+                self.state.mode(),
+            ) {
+                self.write_to_shell(&bytes);
+            }
+            cx.notify();
+            return;
+        }
+
+        let kind = match event.click_count {
+            1 => SelectionType::Simple,
+            2 => SelectionType::Semantic,
+            _ => SelectionType::Lines,
+        };
+        self.state.term_arc().lock().selection = Some(Selection::new(kind, point, side));
+        self.selecting = true;
         cx.notify();
-
-        // TODO: Implement mouse selection
-        // - Convert pixel coordinates to cell coordinates
-        // - Start selection at clicked cell
-        // - Send mouse reports if mouse tracking is enabled
     }
 
-    /// Handle mouse up events.
-    ///
-    /// Currently a placeholder for future mouse selection support.
-    fn on_mouse_up(
-        &mut self,
-        _event: &MouseUpEvent,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-        // TODO: Implement mouse selection
-        // - End selection at released cell
-        // - Copy selection to clipboard if configured
+    /// Handle mouse up events: the selection is done.
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.tracks_mouse() && !self.selecting {
+            let (point, _) = self.grid_point(event.position);
+            let mods = crate::mouse::encode_modifiers(false, event.modifiers.alt, event.modifiers.control);
+            let screen = self.screen_point(point);
+            if let Some(bytes) = crate::mouse::mouse_button_report(
+                MouseButton::Left,
+                false,
+                screen,
+                mods,
+                self.state.mode(),
+            ) {
+                self.write_to_shell(&bytes);
+            }
+            return;
+        }
+        if self.selecting {
+            self.selecting = false;
+            // A click without dragging leaves nothing selected.
+            let empty = {
+                let term = self.state.term_arc();
+                let term = term.lock();
+                term.selection.as_ref().is_some_and(|s| s.is_empty())
+            };
+            if empty {
+                self.state.term_arc().lock().selection = None;
+            } else if self.copy_on_select {
+                self.copy_selection(cx);
+            }
+            cx.notify();
+        }
     }
 
-    /// Handle mouse move events.
-    ///
-    /// Currently a placeholder for future mouse selection support.
-    fn on_mouse_move(
-        &mut self,
-        _event: &MouseMoveEvent,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-        // TODO: Implement mouse selection
-        // - Update selection range while dragging
-        // - Send mouse motion reports if mouse tracking is enabled
+    /// Handle mouse move events: drag the selection.
+    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.selecting && event.pressed_button == Some(MouseButton::Left) {
+            let (point, side) = self.grid_point(event.position);
+            if let Some(selection) = self.state.term_arc().lock().selection.as_mut() {
+                selection.update(point, side);
+            }
+            cx.notify();
+        } else if self.selecting {
+            self.selecting = false; // the button was released outside the window
+        }
     }
 
-    /// Handle scroll events.
-    ///
-    /// Currently a placeholder for future scrollback support.
-    fn on_scroll(
-        &mut self,
-        _event: &ScrollWheelEvent,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-        // TODO: Implement scrollback
-        // - Scroll the terminal display up/down
-        // - Send scroll reports if alternate screen is not active
+    /// Handle the mouse wheel: scroll back through the output, or hand the wheel to a program that
+    /// wants it (a pager, vim, tmux).
+    fn on_scroll(&mut self, event: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        use alacritty_terminal::grid::Scroll;
+        use alacritty_terminal::term::TermMode;
+        let info = *self.paint_info.lock();
+        let cell_h: f32 = info.cell_height.into();
+        if cell_h <= 0.0 {
+            return;
+        }
+        let delta = event.delta.pixel_delta(info.cell_height);
+        let dy: f32 = delta.y.into();
+        self.scroll_accum += dy / cell_h;
+        let lines = self.scroll_accum.trunc() as i32;
+        if lines == 0 {
+            return;
+        }
+        self.scroll_accum -= lines as f32;
+        let mode = self.state.mode();
+
+        if self.tracks_mouse() && !event.modifiers.shift {
+            let (point, _) = self.grid_point(event.position);
+            let mods = crate::mouse::encode_modifiers(false, event.modifiers.alt, event.modifiers.control);
+            let screen = self.screen_point(point);
+            for _ in 0..lines.unsigned_abs().min(10) {
+                if let Some(bytes) = crate::mouse::scroll_report(lines, screen, mods, mode) {
+                    self.write_to_shell(&bytes);
+                }
+            }
+        } else if mode.contains(TermMode::ALT_SCREEN) {
+            // No history on the alternate screen: programs there read the wheel as arrow keys.
+            if mode.contains(TermMode::ALTERNATE_SCROLL) {
+                let arrow: &[u8] = match (lines > 0, mode.contains(TermMode::APP_CURSOR)) {
+                    (true, true) => b"\x1bOA",
+                    (true, false) => b"\x1b[A",
+                    (false, true) => b"\x1bOB",
+                    (false, false) => b"\x1b[B",
+                };
+                for _ in 0..lines.unsigned_abs().min(10) {
+                    self.write_to_shell(arrow);
+                }
+            }
+        } else {
+            self.state.term_arc().lock().scroll_display(Scroll::Delta(lines));
+            cx.notify();
+        }
     }
+
 
     /// Process pending terminal events.
     ///
@@ -1042,6 +1244,7 @@ impl EntityInputHandler for TerminalView {
         ime_trace!("replace_text_in_range range={:?} text={:?}", _range, text);
         self.marked_text = None;
         if !text.is_empty() {
+            self.on_user_input();
             let text = text.replace("\r\n", "\r").replace('\n', "\r");
             self.write_to_shell(text.as_bytes());
         }
@@ -1101,6 +1304,8 @@ impl Render for TerminalView {
         let view = cx.entity();
         let focus_handle = self.focus_handle.clone();
         let marked_text = self.marked_text.clone();
+        let focused = self.focus_handle.is_focused(window);
+        let paint_info = self.paint_info.clone();
 
         div()
             .size_full()
@@ -1127,6 +1332,14 @@ impl Render for TerminalView {
                         // Measure actual cell dimensions from the font
                         let mut measured_renderer = renderer.clone();
                         measured_renderer.measure_cell(window);
+                        *paint_info.lock() = PaintInfo {
+                            origin: Point {
+                                x: bounds.origin.x + padding.left,
+                                y: bounds.origin.y + padding.top,
+                            },
+                            cell_width: measured_renderer.cell_width,
+                            cell_height: measured_renderer.cell_height,
+                        };
 
                         // Calculate available space after padding
                         let available_width: f32 =
@@ -1178,7 +1391,7 @@ impl Render for TerminalView {
                         }
 
                         // Paint the terminal with measured dimensions
-                        measured_renderer.paint(bounds, padding, &term, window, cx);
+                        measured_renderer.paint(bounds, padding, &term, focused, window, cx);
 
                         // What the input method is composing, drawn at the cursor.
                         if let Some(text) = &marked_text {

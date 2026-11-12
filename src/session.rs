@@ -190,9 +190,11 @@ pub fn spawn(
 
     let on_exit: Rc<dyn Fn(&mut App)> = Rc::new(on_exit);
     let option_as_meta = settings.option_as_meta;
+    let copy_on_select = settings.copy_on_select;
     let view = cx.new(|cx| {
         TerminalView::new(writer, reader, config, cx)
             .with_option_as_meta(option_as_meta)
+            .with_copy_on_select(copy_on_select)
             .with_resize_callback(move |cols, rows| {
                 let _ = master.lock().resize(PtySize {
                     rows: rows as u16,
