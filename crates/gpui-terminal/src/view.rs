@@ -577,6 +577,16 @@ impl TerminalView {
         self
     }
 
+    /// Changes the Option behavior of a terminal that is already running.
+    pub fn set_option_as_meta(&mut self, on: bool) {
+        self.option_as_meta = on;
+    }
+
+    /// Changes copy-on-select of a terminal that is already running.
+    pub fn set_copy_on_select(&mut self, on: bool) {
+        self.copy_on_select = on;
+    }
+
     /// Make Option act as Meta (sends ESC before the key) instead of typing characters.
     pub fn with_option_as_meta(mut self, on: bool) -> Self {
         self.option_as_meta = on;

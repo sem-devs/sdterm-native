@@ -120,11 +120,12 @@ impl Focusable for TextInput {
 }
 
 impl TextInput {
-    /// A field with `text` already in it and all of it selected, ready to be replaced.
+    /// A field with `text` already in it. `select_all` selects it, ready to be replaced.
     pub fn new(
         text: &str,
         placeholder: &str,
         multiline: bool,
+        select_all: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -136,7 +137,7 @@ impl TextInput {
             focus,
             text: text.to_string(),
             cursor: text.len(),
-            anchor: if text.is_empty() { None } else { Some(0) },
+            anchor: if select_all && !text.is_empty() { Some(0) } else { None },
             marked: None,
             placeholder: placeholder.to_string().into(),
             multiline,
@@ -146,6 +147,10 @@ impl TextInput {
 
     pub fn focus(&self, window: &mut Window) {
         window.focus(&self.focus);
+    }
+
+    pub fn is_focused(&self, window: &Window) -> bool {
+        self.focus.is_focused(window)
     }
 
     pub fn text(&self) -> &str {
@@ -302,7 +307,7 @@ impl Render for TextInput {
             let end = start + line.len();
             let mut row = div().flex().items_center().min_h(px(18.)).whitespace_nowrap();
             let overlap = sel.start.max(start)..sel.end.min(end);
-            if !sel.is_empty() && overlap.start < overlap.end {
+            if focused && !sel.is_empty() && overlap.start < overlap.end {
                 row = row
                     .child(self.text[start..overlap.start].to_string())
                     .child(div().bg(selection_bg).child(self.text[overlap.clone()].to_string()))
@@ -334,6 +339,7 @@ impl Render for TextInput {
             .overflow_hidden()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key_down))
+            .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, window, _| window.focus(&this.focus)))
             .child(
                 canvas(
                     |bounds, _, _| bounds,

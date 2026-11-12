@@ -71,7 +71,7 @@ pub fn main_area(snap: Snapshot, theme: &Theme, state: &Entity<AppState>) -> Any
         });
 
     let body: AnyElement = if snap.view == View::Settings {
-        super::settings_view(&snap, theme, state)
+        super::settings::settings_view(&snap, theme, state)
     } else {
         match &snap.active {
             None => empty_state(

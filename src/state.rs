@@ -11,11 +11,32 @@ use std::time::Duration;
 use gpui::{Context, Task};
 
 use crate::model::{
-    LayoutId, PANE_COLORS, Pane, PaneColor, PersistedWorkspaces, StoreData, Workspace, new_id,
+    LayoutId, PANE_COLORS, Pane, PaneColor, PersistedWorkspaces, Settings, StoreData, Workspace, new_id,
 };
 use crate::session::{self, Session};
 use crate::store;
 use crate::theme::Theme;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsSection {
+    Appearance,
+    Terminal,
+    Workspaces,
+    Resources,
+    Updates,
+    Shortcuts,
+    About,
+}
+
+pub const SETTINGS_SECTIONS: [(SettingsSection, &str); 7] = [
+    (SettingsSection::Appearance, "Appearance"),
+    (SettingsSection::Terminal, "Terminal"),
+    (SettingsSection::Workspaces, "Workspaces"),
+    (SettingsSection::Resources, "Resources"),
+    (SettingsSection::Updates, "Updates"),
+    (SettingsSection::Shortcuts, "Shortcuts"),
+    (SettingsSection::About, "About"),
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
@@ -47,8 +68,10 @@ pub struct AppState {
     /// The running shells, by terminal id.
     pub sessions: HashMap<String, Session>,
     pub view: View,
+    pub settings_section: SettingsSection,
     pub sidebar_collapsed: bool,
     pub show_parked: bool,
+    pub confirm_reset: bool,
     pub editing: Option<Edit>,
     pub menu: Option<Menu>,
     /// A terminal that should get the keyboard focus on the next frame.
@@ -125,8 +148,10 @@ impl AppState {
             window_id,
             sessions: HashMap::new(),
             view: View::Terminals,
+            settings_section: SettingsSection::Appearance,
             sidebar_collapsed: false,
             show_parked: false,
+            confirm_reset: false,
             editing: None,
             menu: None,
             pending_focus: None,
@@ -327,6 +352,45 @@ impl AppState {
     pub fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
         self.view = view;
         cx.notify();
+    }
+
+    pub fn set_settings_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+        self.settings_section = section;
+        cx.notify();
+    }
+
+    /// Changes a setting. It takes effect at once: the theme, and the font, colors and keys of the
+    /// terminals that are already open.
+    pub fn update_settings(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut Settings)) {
+        let mut settings = self.data.settings.clone();
+        change(&mut settings);
+        self.data.settings = settings.normalized();
+        self.apply_settings(cx);
+        self.changed(cx);
+    }
+
+    pub fn reset_settings(&mut self, cx: &mut Context<Self>) {
+        self.data.settings = Settings::default();
+        self.apply_settings(cx);
+        self.changed(cx);
+    }
+
+    fn apply_settings(&mut self, cx: &mut Context<Self>) {
+        let dark = matches!(
+            cx.window_appearance(),
+            gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+        );
+        let theme = Theme::for_mode(self.data.settings.appearance.theme, dark);
+        cx.set_global(theme.clone());
+        let settings = self.data.settings.terminal.clone();
+        for session in self.sessions.values() {
+            let config = session::terminal_config(&settings, &theme);
+            session.view.update(cx, |view, cx| {
+                view.update_config(config, cx);
+                view.set_option_as_meta(settings.option_as_meta);
+                view.set_copy_on_select(settings.copy_on_select);
+            });
+        }
     }
 
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {

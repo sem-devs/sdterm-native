@@ -3,8 +3,10 @@
 //! Views only read a snapshot of the state and call methods on it; they never change data
 //! themselves, so everything they do goes through the same checks and the same saving.
 
+mod controls;
 mod panes;
 mod parts;
+mod settings;
 mod sidebar;
 
 use std::collections::{HashMap, HashSet};
@@ -15,8 +17,8 @@ use gpui::{
 };
 use gpui_terminal::TerminalView;
 
-use crate::model::Workspace;
-use crate::state::{AppState, Edit, Menu, View};
+use crate::model::{Settings, Workspace};
+use crate::state::{AppState, Edit, Menu, SettingsSection, View};
 use crate::text_input::{InputEvent, TextInput};
 use crate::theme::Theme;
 
@@ -40,6 +42,11 @@ pub(crate) struct Snapshot {
     pub views: HashMap<String, Entity<TerminalView>>,
     pub focused: HashSet<String>,
     pub menu: Option<Menu>,
+    pub settings: Settings,
+    pub settings_section: SettingsSection,
+    pub confirm_reset: bool,
+    /// The text fields of the settings page.
+    pub setting_inputs: HashMap<&'static str, Entity<TextInput>>,
     /// The text field of whatever is being renamed or written, with what it is for.
     pub editor: Option<(Edit, Entity<TextInput>)>,
 }
@@ -48,6 +55,7 @@ impl Snapshot {
     fn take(
         state: &AppState,
         editor: Option<(Edit, Entity<TextInput>)>,
+        setting_inputs: HashMap<&'static str, Entity<TextInput>>,
         window: &Window,
         cx: &App,
     ) -> Self {
@@ -67,6 +75,10 @@ impl Snapshot {
             views,
             focused,
             menu: state.menu.clone(),
+            settings: state.data.settings.clone(),
+            settings_section: state.settings_section,
+            confirm_reset: state.confirm_reset,
+            setting_inputs,
             editor,
         }
     }
@@ -77,29 +89,20 @@ pub(crate) fn resources_summary(_theme: &Theme, _snap: &Snapshot) -> AnyElement 
     div().into_any_element()
 }
 
-/// The settings page.
-pub(crate) fn settings_view(_snap: &Snapshot, theme: &Theme, _state: &Entity<AppState>) -> AnyElement {
-    div()
-        .size_full()
-        .p_8()
-        .text_color(theme.muted_foreground)
-        .child("Settings come next.")
-        .into_any_element()
-}
-
 // ---- The root view -------------------------------------------------------------------------
 
 pub struct Root {
     state: Entity<AppState>,
     focus_subs: HashMap<String, Subscription>,
     editor: Option<(Edit, Entity<TextInput>, Subscription)>,
+    setting_inputs: HashMap<&'static str, (Entity<TextInput>, Subscription)>,
     _observe: Subscription,
 }
 
 impl Root {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let _observe = cx.observe(&state, |_, _, cx| cx.notify());
-        Self { state, focus_subs: HashMap::new(), editor: None, _observe }
+        Self { state, focus_subs: HashMap::new(), editor: None, setting_inputs: HashMap::new(), _observe }
     }
 
     /// Keeps the state in step with where the keyboard focus is, and moves it when asked.
@@ -156,13 +159,67 @@ impl Root {
                     ),
                 }
             };
-            let input = cx.new(|cx| TextInput::new(&initial, placeholder, multiline, window, cx));
+            let input = cx.new(|cx| TextInput::new(&initial, placeholder, multiline, true, window, cx));
             input.read(cx).focus(window);
             let sub = cx.subscribe_in(&input, window, |this, _input, event: &InputEvent, _window, cx| {
                 this.on_input(event, cx);
             });
             (edit, input, sub)
         });
+    }
+
+    /// The text fields of the Terminal settings exist while that page is open.
+    fn sync_setting_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        const FIELDS: [(&str, &str); 3] = [
+            ("shell", "Login shell"),
+            ("start_directory", "Home folder"),
+            ("custom_font", "Font name"),
+        ];
+        let (view, section, settings) = {
+            let s = self.state.read(cx);
+            (s.view, s.settings_section, s.data.settings.clone())
+        };
+        if view != View::Settings || section != SettingsSection::Terminal {
+            self.setting_inputs.clear();
+            return;
+        }
+        let value = |key: &str| match key {
+            "shell" => settings.terminal.shell.clone(),
+            "start_directory" => settings.terminal.start_directory.clone(),
+            _ => settings.terminal.custom_font_family.clone(),
+        };
+        for (key, placeholder) in FIELDS {
+            // A value changed from elsewhere (the folder chooser): start the field again.
+            let stale = self
+                .setting_inputs
+                .get(key)
+                .is_some_and(|(input, _)| {
+                    let input = input.read(cx);
+                    input.text() != value(key) && !input.is_focused(window)
+                });
+            if stale {
+                self.setting_inputs.remove(key);
+            }
+            if self.setting_inputs.contains_key(key) {
+                continue;
+            }
+            let initial = value(key);
+            let input = cx.new(|cx| TextInput::new(&initial, placeholder, false, false, window, cx));
+            let sub = cx.subscribe_in(&input, window, move |this, _input, event: &InputEvent, _window, cx| {
+                let text = match event {
+                    InputEvent::Submit(t) | InputEvent::Blur(t) => t.clone(),
+                    InputEvent::Cancel => return,
+                };
+                this.state.update(cx, |state, cx| {
+                    state.update_settings(cx, |s| match key {
+                        "shell" => s.terminal.shell = text.trim().to_string(),
+                        "start_directory" => s.terminal.start_directory = text.trim().to_string(),
+                        _ => s.terminal.custom_font_family = text.trim().to_string(),
+                    })
+                });
+            });
+            self.setting_inputs.insert(key, (input, sub));
+        }
     }
 
     fn on_input(&mut self, event: &InputEvent, cx: &mut Context<Self>) {
@@ -189,9 +246,11 @@ impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_focus(window, cx);
         self.sync_editor(window, cx);
+        self.sync_setting_inputs(window, cx);
         let theme = cx.global::<Theme>().clone();
         let editor = self.editor.as_ref().map(|(e, i, _)| (e.clone(), i.clone()));
-        let snap = Snapshot::take(self.state.read(cx), editor, window, cx);
+        let inputs = self.setting_inputs.iter().map(|(k, (i, _))| (*k, i.clone())).collect();
+        let snap = Snapshot::take(self.state.read(cx), editor, inputs, window, cx);
         let state = self.state.clone();
 
         let mut root = div()
