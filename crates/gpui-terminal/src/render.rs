@@ -72,6 +72,36 @@ use gpui::{
     SharedString, Size, TextRun, UnderlineStyle, Window, px, quad, transparent_black,
 };
 
+/// What is drawn on top of the grid besides the cells: search matches, the link under the pointer
+/// and the phase of the blinking cursor.
+pub struct PaintExtras<'a> {
+    /// The cursor is in its visible phase (always true when it does not blink).
+    pub cursor_on: bool,
+    /// Search matches in order, and which one is the current one.
+    pub matches: &'a [std::ops::RangeInclusive<AlacPoint>],
+    pub active_match: Option<usize>,
+    /// The link the pointer is over while Cmd (Ctrl) is held: first and last cell.
+    pub link: Option<(AlacPoint, AlacPoint)>,
+}
+
+impl Default for PaintExtras<'_> {
+    fn default() -> Self {
+        Self { cursor_on: true, matches: &[], active_match: None, link: None }
+    }
+}
+
+/// The columns a range covers on one line, if it reaches that line.
+fn columns_on_line(range: &std::ops::RangeInclusive<AlacPoint>, line: Line, cols: usize) -> Option<(usize, usize)> {
+    let (start, end) = (range.start(), range.end());
+    if line < start.line || line > end.line {
+        return None;
+    }
+    let from = if line == start.line { start.column.0 } else { 0 };
+    let to = if line == end.line { end.column.0 } else { cols.saturating_sub(1) };
+    (from <= to).then_some((from, to.min(cols.saturating_sub(1))))
+}
+
+
 /// A batched run of text with consistent styling.
 ///
 /// This struct groups adjacent terminal cells with identical visual attributes
@@ -451,6 +481,7 @@ impl TerminalRenderer {
         padding: Edges<Pixels>,
         term: &Term<GpuiEventProxy>,
         focused: bool,
+        extras: &PaintExtras<'_>,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -468,6 +499,9 @@ impl TerminalRenderer {
         let cursor_color = self.palette.resolve(Color::Named(NamedColor::Cursor), colors);
         let mut selection_color = cursor_color;
         selection_color.a = 0.35;
+        let match_color: Hsla = gpui::rgba(0xffd33d66).into();
+        let match_active: Hsla = gpui::rgba(0xff8c1aaa).into();
+        let link_color = self.palette.resolve(Color::Named(NamedColor::Foreground), colors);
 
         let fill = |window: &mut Window, rect: Bounds<Pixels>, color: Hsla| {
             window.paint_quad(quad(
@@ -565,6 +599,43 @@ impl TerminalRenderer {
                 col = end;
             }
 
+            // Search matches, the current one stronger.
+            let first = extras.matches.partition_point(|m| m.end().line < line);
+            for (i, m) in extras.matches.iter().enumerate().skip(first) {
+                if m.start().line > line {
+                    break;
+                }
+                if let Some((from, to)) = columns_on_line(m, line, num_cols) {
+                    let color = if extras.active_match == Some(i) { match_active } else { match_color };
+                    fill(
+                        window,
+                        Bounds {
+                            origin: Point { x: origin.x + self.cell_width * (from as f32), y },
+                            size: Size {
+                                width: self.cell_width * ((to - from + 1) as f32),
+                                height: self.cell_height,
+                            },
+                        },
+                        color,
+                    );
+                }
+            }
+
+            // The link under the pointer is underlined.
+            if let Some((link_start, link_end)) = extras.link {
+                let range = link_start..=link_end;
+                if let Some((from, to)) = columns_on_line(&range, line, num_cols) {
+                    fill(
+                        window,
+                        Bounds {
+                            origin: Point { x: origin.x + self.cell_width * (from as f32), y: y + self.cell_height - px(2.0) },
+                            size: Size { width: self.cell_width * ((to - from + 1) as f32), height: thin },
+                        },
+                        link_color,
+                    );
+                }
+            }
+
             // The characters, each at its exact cell so the columns always line up.
             for (col_idx, (ch, fg, _bg, flags, _selected)) in cells.iter().enumerate() {
                 if flags.contains(Flags::WIDE_CHAR_SPACER) || flags.contains(Flags::HIDDEN) {
@@ -626,7 +697,7 @@ impl TerminalRenderer {
 
         // The cursor: solid when the terminal has the keyboard focus, an outline when it does not.
         let cursor = grid.cursor.point;
-        let visible = term.mode().contains(TermMode::SHOW_CURSOR) && offset == 0;
+        let visible = term.mode().contains(TermMode::SHOW_CURSOR) && offset == 0 && (extras.cursor_on || !focused);
         let row = cursor.line.0;
         if visible && row >= 0 && (row as usize) < num_lines {
             let shape = term.cursor_style().shape;

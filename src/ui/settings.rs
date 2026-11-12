@@ -217,6 +217,12 @@ fn terminal(snap: &Snapshot, theme: &Theme, state: &Entity<AppState>) -> AnyElem
     ));
     text_rows.push(row(
         theme,
+        "Blinking cursor",
+        Some("The cursor blinks while the terminal has the keyboard focus. Programs can still ask for it."),
+        on_off("blink", t.cursor_blink, theme, state, |s, v| s.terminal.cursor_blink = v),
+    ));
+    text_rows.push(row(
+        theme,
         "Scrollback",
         Some("Lines kept per terminal, for scrolling back. Applies to terminals you open next."),
         choice(
@@ -438,6 +444,9 @@ fn shortcuts(theme: &Theme) -> AnyElement {
         ("Settings", format!("{m},")),
         ("Copy", if MAC { "⌘C".into() } else { "Ctrl+Shift+C".into() }),
         ("Paste", if MAC { "⌘V".into() } else { "Ctrl+Shift+V".into() }),
+        ("Find in the terminal", if MAC { "⌘F".into() } else { "Ctrl+Shift+F".into() }),
+        ("Next or previous match", "Enter, Shift+Enter".into()),
+        ("Open a link", if MAC { "⌘ + click".into() } else { "Ctrl + click".into() }),
     ];
     let mut list = Vec::new();
     for (label, keys) in rows {

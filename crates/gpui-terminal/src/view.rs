@@ -50,12 +50,16 @@
 use crate::colors::ColorPalette;
 use crate::event::{GpuiEventProxy, TerminalEvent};
 use crate::input::keystroke_to_bytes;
-use crate::render::TerminalRenderer;
+use crate::links::{self, Link};
+use crate::render::{PaintExtras, TerminalRenderer};
 use crate::terminal::TerminalState;
+use alacritty_terminal::index::Point as AlacPoint;
+use gpui::prelude::FluentBuilder;
 use gpui::{Edges, *};
 use std::io::{Read, Write};
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use std::sync::mpsc;
 use std::thread;
 
@@ -130,6 +134,9 @@ pub struct TerminalConfig {
     /// The cursor shape programs get unless they ask for another.
     pub cursor_shape: alacritty_terminal::vte::ansi::CursorShape,
 
+    /// The cursor blinks while the terminal has the keyboard focus (programs can ask for it too).
+    pub cursor_blink: bool,
+
     /// Multiplier for line height to accommodate tall glyphs (e.g., nerd fonts)
     /// Default is 1.2 (20% extra height)
     pub line_height_multiplier: f32,
@@ -152,6 +159,7 @@ impl Default for TerminalConfig {
             font_size: px(14.0),
             scrollback: 10000,
             cursor_shape: alacritty_terminal::vte::ansi::CursorShape::Block,
+            cursor_blink: false,
             line_height_multiplier: 1.2,
             padding: Edges::all(px(0.0)),
             colors: ColorPalette::default(),
@@ -383,6 +391,43 @@ struct PaintInfo {
     origin: Point<Pixels>,
     cell_width: Pixels,
     cell_height: Pixels,
+    /// The whole painted area, to tell whether the pointer is over the terminal.
+    bounds: Bounds<Pixels>,
+}
+
+/// Most matches a search keeps; more than this is not useful to step through.
+const MAX_MATCHES: usize = 5000;
+
+/// How often the matches are searched again while output keeps arriving.
+const SEARCH_REFRESH: Duration = Duration::from_millis(300);
+
+/// Find in the output (Cmd+F, Ctrl+Shift+F elsewhere).
+#[derive(Default)]
+struct Search {
+    open: bool,
+    query: String,
+    matches: Arc<Vec<RangeInclusive<AlacPoint>>>,
+    active: Option<usize>,
+    /// New output arrived since the matches were found.
+    dirty: bool,
+    computed: Option<Instant>,
+}
+
+/// The query as a pattern that matches exactly that text.
+fn escape_regex(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 2);
+    for c in text.chars() {
+        if "\\.+*?()|[]{}^$#&-~".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The key that makes links work: Cmd on a Mac, Ctrl elsewhere.
+fn link_modifier(m: &Modifiers) -> bool {
+    if cfg!(target_os = "macos") { m.platform } else { m.control }
 }
 
 pub struct TerminalView {
@@ -423,6 +468,24 @@ pub struct TerminalView {
 
     /// Copy the selection to the clipboard as soon as it is made.
     copy_on_select: bool,
+
+    /// Phase of the blinking cursor.
+    blink_on: bool,
+
+    /// The terminal has the keyboard focus (set on every render): only a focused cursor blinks.
+    focused_now: bool,
+
+    #[allow(dead_code)]
+    _blink_task: Task<()>,
+
+    /// The link under the pointer while Cmd (Ctrl) is held.
+    hover_link: Option<Link>,
+
+    /// Find in the output.
+    search: Search,
+
+    /// The title the program set (OSC 0 or 2).
+    title: String,
 
     /// Async task that reads bytes and notifies the view (push-based)
     #[allow(dead_code)]
@@ -552,6 +615,7 @@ impl TerminalView {
             event_proxy,
             config.scrollback,
             config.cursor_shape,
+            config.cursor_blink,
         );
 
         // Create renderer with font settings and color palette
@@ -591,6 +655,9 @@ impl TerminalView {
                         // Process bytes and notify the view
                         let result = this.update(cx, |view: &mut Self, cx: &mut Context<Self>| {
                             view.state.process_bytes(&bytes);
+                            if view.search.open {
+                                view.search.dirty = true;
+                            }
                             cx.notify();
                         });
                         if result.is_err() {
@@ -611,6 +678,15 @@ impl TerminalView {
             }
         });
 
+        let blink_task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(530)).await;
+                if this.update(cx, |view: &mut Self, cx: &mut Context<Self>| view.blink_tick(cx)).is_err() {
+                    break;
+                }
+            }
+        });
+
         Self {
             state,
             renderer,
@@ -624,6 +700,12 @@ impl TerminalView {
             selecting: false,
             scroll_accum: 0.0,
             copy_on_select: false,
+            blink_on: true,
+            focused_now: false,
+            _blink_task: blink_task,
+            hover_link: None,
+            search: Search::default(),
+            title: String::new(),
             _reader_task: reader_task,
             resize_callback: None,
             key_handler: None,
@@ -836,7 +918,7 @@ impl TerminalView {
     /// Converts GPUI keystrokes to terminal escape sequences and writes them
     /// to the stdin writer. If a key handler is set and returns true, the event
     /// is consumed and not sent to the terminal.
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         // Check if key handler wants to consume this event
         if let Some(ref handler) = self.key_handler
             && handler(event)
@@ -844,13 +926,10 @@ impl TerminalView {
             return; // Event consumed by handler
         }
 
-        // Keys that type text (letters, digits, symbols, Option+key on a layout that has them,
-        // dead keys) belong to the system input method: it composes accents and delivers the
-        // result to `replace_text_in_range`. Writing them here too would type everything twice.
         let ks = &event.keystroke;
         let m = &ks.modifiers;
-        // Copy and paste: Cmd+C / Cmd+V on a Mac, Ctrl+Shift+C / V elsewhere (plain Ctrl+C is
-        // the interrupt and must reach the shell).
+        // Copy, paste and find: Cmd+C / V / F on a Mac, Ctrl+Shift+C / V / F elsewhere (plain
+        // Ctrl+C is the interrupt and must reach the shell).
         let chord = |key: &str| {
             ks.key == key
                 && if cfg!(target_os = "macos") {
@@ -859,24 +938,40 @@ impl TerminalView {
                     m.control && m.shift && !m.alt
                 }
         };
+        if chord("f") {
+            self.search_open(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if self.search.open && self.search_key(event, chord("v"), cx) {
+            return;
+        }
         if chord("c") {
-            self.copy_selection(_cx);
-            _cx.stop_propagation();
+            self.copy_selection(cx);
+            cx.stop_propagation();
             return;
         }
         if chord("v") {
-            self.paste_clipboard(_cx);
-            _cx.stop_propagation();
+            self.paste_clipboard(cx);
+            cx.stop_propagation();
             return;
         }
+        // Keys that type text (letters, digits, symbols, Option+key on a layout that has them,
+        // dead keys) belong to the system input method: it composes accents and delivers the
+        // result to `replace_text_in_range`. Writing them here too would type everything twice.
         if types_text(ks, self.option_as_meta) {
             return; // propagate: GPUI hands the key to the input method
+        }
+        // While finding, the other keys do not reach the shell.
+        if self.search.open {
+            cx.stop_propagation();
+            return;
         }
 
         if let Some(bytes) = keystroke_to_bytes(&event.keystroke, self.state.mode()) {
             self.on_user_input();
             self.write_to_shell(&bytes);
-            _cx.stop_propagation(); // handled: do not feed it to the input method as well
+            cx.stop_propagation(); // handled: do not feed it to the input method as well
         }
     }
 
@@ -919,6 +1014,7 @@ impl TerminalView {
     /// and drop the selection, like every terminal.
     fn on_user_input(&mut self) {
         use alacritty_terminal::grid::Scroll;
+        self.blink_on = true;
         let term = self.state.term_arc();
         let mut term = term.lock();
         term.scroll_display(Scroll::Bottom);
@@ -1002,6 +1098,12 @@ impl TerminalView {
     fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         use alacritty_terminal::selection::{Selection, SelectionType};
         window.focus(&self.focus_handle);
+        if link_modifier(&event.modifiers) {
+            if let Some(link) = self.link_under(event.position) {
+                cx.open_url(&link.url);
+                return;
+            }
+        }
         let (point, side) = self.grid_point(event.position);
 
         if self.tracks_mouse() && !event.modifiers.shift {
@@ -1066,6 +1168,15 @@ impl TerminalView {
 
     /// Handle mouse move events: drag the selection.
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let hover = if link_modifier(&event.modifiers) && !self.selecting {
+            self.link_under(event.position)
+        } else {
+            None
+        };
+        if hover != self.hover_link {
+            self.hover_link = hover;
+            cx.notify();
+        }
         if self.selecting && event.pressed_button == Some(MouseButton::Left) {
             let (point, side) = self.grid_point(event.position);
             if let Some(selection) = self.state.term_arc().lock().selection.as_mut() {
@@ -1144,6 +1255,7 @@ impl TerminalView {
                     }
                 }
                 TerminalEvent::Title(title) => {
+                    self.title = title.clone();
                     if let Some(ref callback) = self.title_callback {
                         callback(window, cx, &title);
                     }
@@ -1226,7 +1338,11 @@ impl TerminalView {
         self.state
             .term_arc()
             .lock()
-            .set_options(crate::terminal::TerminalState::term_config(config.scrollback, config.cursor_shape));
+            .set_options(crate::terminal::TerminalState::term_config(
+                config.scrollback,
+                config.cursor_shape,
+                config.cursor_blink,
+            ));
 
         // Store the new config
         self.config = config;
@@ -1248,6 +1364,230 @@ impl TerminalView {
         let cols = ((width_f32 / cell_width_f32) as usize).max(1);
         let rows = ((height_f32 / cell_height_f32) as usize).max(1);
         (cols, rows)
+    }
+}
+
+impl TerminalView {
+    /// The folder the shell last reported with OSC 7 or OSC 9;9, if it ever did.
+    pub fn cwd(&self) -> Option<String> {
+        self.state.cwd().map(str::to_string)
+    }
+
+    /// The title the program set (OSC 0 or 2); empty when it never did or reset it.
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// Every half second: show or hide a blinking cursor. Only the terminal that has the keyboard
+    /// focus blinks, and the cursor is always shown while it does not.
+    fn blink_tick(&mut self, cx: &mut Context<Self>) {
+        let blinking = self.focused_now && self.state.with_term(|term| term.cursor_style().blinking);
+        if blinking {
+            self.blink_on = !self.blink_on;
+            cx.notify();
+        } else if !self.blink_on {
+            self.blink_on = true;
+            cx.notify();
+        }
+    }
+
+    /// The link under a pixel position, if there is one.
+    fn link_under(&self, position: Point<Pixels>) -> Option<Link> {
+        let (point, _) = self.grid_point(position);
+        self.state.with_term(|term| links::link_at(term, point))
+    }
+
+    // ---- Find ---------------------------------------------------------------------------
+
+    /// Opens the find bar, starting from the selected text when it is a short single line.
+    fn search_open(&mut self, cx: &mut Context<Self>) {
+        if !self.search.open {
+            self.search.open = true;
+            let selected = self.state.with_term(|term| term.selection_to_string());
+            if let Some(text) = selected.filter(|t| !t.is_empty() && !t.contains('\n') && t.chars().count() <= 100) {
+                self.search.query = text;
+            }
+        }
+        self.search_refresh(true);
+        cx.notify();
+    }
+
+    fn search_close(&mut self, cx: &mut Context<Self>) {
+        self.search.open = false;
+        self.search.matches = Arc::default();
+        self.search.active = None;
+        cx.notify();
+    }
+
+    /// Every match of the query in the history and on screen, top to bottom.
+    fn find_matches(&self, query: &str) -> Vec<RangeInclusive<AlacPoint>> {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::{Column, Direction};
+        use alacritty_terminal::term::search::{RegexIter, RegexSearch};
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let Ok(mut regex) = RegexSearch::new(&escape_regex(query)) else { return Vec::new() };
+        self.state.with_term(|term| {
+            let start = AlacPoint::new(term.topmost_line(), Column(0));
+            let end = AlacPoint::new(term.bottommost_line(), term.last_column());
+            RegexIter::new(start, end, Direction::Right, term, &mut regex).take(MAX_MATCHES).collect()
+        })
+    }
+
+    /// Searches again. With `jump` the current match is the first one on screen (or the last one
+    /// in the history) and the view moves to it.
+    fn search_refresh(&mut self, jump: bool) {
+        let matches = self.find_matches(&self.search.query);
+        let active = if matches.is_empty() {
+            None
+        } else if jump || self.search.active.is_none() {
+            let top = self.state.with_term(|term| -(term.grid().display_offset() as i32));
+            Some(matches.iter().position(|m| m.start().line.0 >= top).unwrap_or(matches.len() - 1))
+        } else {
+            Some(self.search.active.unwrap_or(0).min(matches.len() - 1))
+        };
+        self.search.matches = Arc::new(matches);
+        self.search.active = active;
+        self.search.dirty = false;
+        self.search.computed = Some(Instant::now());
+        if jump {
+            self.scroll_to_active();
+        }
+    }
+
+    /// Scrolls so the current match is on screen.
+    fn scroll_to_active(&mut self) {
+        let Some(found) = self.search.active.and_then(|i| self.search.matches.get(i)) else { return };
+        let start = *found.start();
+        self.state.with_term_mut(|term| term.scroll_to_point(start));
+    }
+
+    /// Moves to the next (or previous) match, wrapping around.
+    fn search_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if self.search.dirty {
+            self.search_refresh(false);
+        }
+        let len = self.search.matches.len();
+        if len == 0 {
+            return;
+        }
+        let current = self.search.active.unwrap_or(0);
+        self.search.active = Some(if forward { (current + 1) % len } else { (current + len - 1) % len });
+        self.scroll_to_active();
+        cx.notify();
+    }
+
+    /// Keys of the find bar. Returns whether the key was used.
+    fn search_key(&mut self, event: &KeyDownEvent, paste: bool, cx: &mut Context<Self>) -> bool {
+        let ks = &event.keystroke;
+        let m = &ks.modifiers;
+        let plain = !m.control && !m.platform && !m.alt;
+        match ks.key.as_str() {
+            "escape" => self.search_close(cx),
+            "enter" => self.search_step(!m.shift, cx),
+            "up" | "down" if plain => self.search_step(ks.key == "down", cx),
+            "g" if cfg!(target_os = "macos") && m.platform => self.search_step(!m.shift, cx),
+            "backspace" => {
+                if m.platform || m.alt {
+                    self.search.query.clear();
+                } else {
+                    self.search.query.pop();
+                }
+                self.search_refresh(true);
+                cx.notify();
+            }
+            _ if paste => {
+                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                    let line: String = text.lines().next().unwrap_or("").chars().filter(|c| !c.is_control()).collect();
+                    if !line.is_empty() {
+                        self.search.query.push_str(&line);
+                        self.search_refresh(true);
+                    }
+                }
+                cx.notify();
+            }
+            _ => return false,
+        }
+        cx.stop_propagation();
+        true
+    }
+
+    /// The find bar, at the top right of the terminal.
+    fn search_bar(&self, bg: Hsla, fg: Hsla, border: Hsla, muted: Hsla, cx: &mut Context<Self>) -> AnyElement {
+        let status = if self.search.query.is_empty() {
+            String::new()
+        } else if self.search.matches.is_empty() {
+            "No results".to_string()
+        } else {
+            format!("{} of {}", self.search.active.map_or(0, |a| a + 1), self.search.matches.len())
+        };
+        let hover = fg.opacity(0.14);
+        let button = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(22.))
+                .rounded_md()
+                .cursor_pointer()
+                .text_color(muted)
+                .hover(move |s| s.bg(hover).text_color(fg))
+                .child(label)
+        };
+        div()
+            .absolute()
+            .top(px(10.))
+            .right(px(16.))
+            .flex()
+            .items_center()
+            .gap_1()
+            .pl_3()
+            .pr_1()
+            .py_1()
+            .rounded_lg()
+            .border_1()
+            .border_color(border)
+            .bg(bg)
+            .text_color(fg)
+            .text_size(px(13.))
+            .font_family(".SystemUIFont")
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .min_w(px(150.))
+                    .max_w(px(280.))
+                    .overflow_hidden()
+                    .child(div().child(self.search.query.clone()))
+                    .child(div().w(px(1.)).h(px(15.)).bg(fg))
+                    .when(self.search.query.is_empty(), |d| d.child(div().ml_1().text_color(muted).child("Find"))),
+            )
+            .child(div().text_size(px(12.)).text_color(muted).px_1().child(status))
+            .child(button("find-prev", "\u{2191}").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.search_step(false, cx);
+                    cx.stop_propagation();
+                }),
+            ))
+            .child(button("find-next", "\u{2193}").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.search_step(true, cx);
+                    cx.stop_propagation();
+                }),
+            ))
+            .child(button("find-close", "\u{00d7}").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.search_close(cx);
+                    cx.stop_propagation();
+                }),
+            ))
+            .into_any_element()
     }
 }
 
@@ -1317,6 +1657,15 @@ impl EntityInputHandler for TerminalView {
         // takes Enter as carriage return.
         ime_trace!("replace_text_in_range range={:?} text={:?}", _range, text);
         self.marked_text = None;
+        if self.search.open {
+            let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+            if !clean.is_empty() {
+                self.search.query.push_str(&clean);
+                self.search_refresh(true);
+            }
+            cx.notify();
+            return;
+        }
         if !text.is_empty() {
             self.on_user_input();
             let text = text.replace("\r\n", "\r").replace('\n', "\r");
@@ -1377,14 +1726,56 @@ impl Render for TerminalView {
         let padding = self.config.padding;
         let view = cx.entity();
         let focus_handle = self.focus_handle.clone();
-        let marked_text = self.marked_text.clone();
+        let marked_text = if self.search.open { None } else { self.marked_text.clone() };
         let focused = self.focus_handle.is_focused(window);
+        self.focused_now = focused;
         let paint_info = self.paint_info.clone();
+
+        // New output while finding: look again, but not on every frame.
+        if self.search.open
+            && self.search.dirty
+            && self.search.computed.is_none_or(|t| t.elapsed() > SEARCH_REFRESH)
+        {
+            self.search_refresh(false);
+        }
+        let matches = self.search.matches.clone();
+        let active_match = self.search.active;
+        let link = self.hover_link.as_ref().map(|l| (l.start, l.end));
+        let cursor_on = self.blink_on;
+        let search_bar = if self.search.open {
+            let (bg, fg) = {
+                let term = state_arc.lock();
+                let colors = term.colors();
+                use alacritty_terminal::vte::ansi::{Color as TermColor, NamedColor};
+                (
+                    renderer.palette.resolve(TermColor::Named(NamedColor::Background), colors),
+                    renderer.palette.resolve(TermColor::Named(NamedColor::Foreground), colors),
+                )
+            };
+            Some(self.search_bar(bg.blend(fg.opacity(0.12)), fg, fg.opacity(0.25), fg.opacity(0.55), cx))
+        } else {
+            None
+        };
 
         div()
             .size_full()
+            .relative()
             .bg(rgb(0x1e1e1e))
             .track_focus(&self.focus_handle)
+            .when(self.hover_link.is_some(), |d| d.cursor_pointer())
+            .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, window, cx| {
+                let position = window.mouse_position();
+                let inside = this.paint_info.lock().bounds.contains(&position);
+                let hover = if inside && link_modifier(&event.modifiers) && !this.selecting {
+                    this.link_under(position)
+                } else {
+                    None
+                };
+                if hover != this.hover_link {
+                    this.hover_link = hover;
+                    cx.notify();
+                }
+            }))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -1413,6 +1804,7 @@ impl Render for TerminalView {
                             },
                             cell_width: measured_renderer.cell_width,
                             cell_height: measured_renderer.cell_height,
+                            bounds,
                         };
 
                         // Calculate available space after padding
@@ -1465,7 +1857,13 @@ impl Render for TerminalView {
                         }
 
                         // Paint the terminal with measured dimensions
-                        measured_renderer.paint(bounds, padding, &term, focused, window, cx);
+                        let extras = PaintExtras {
+                            cursor_on,
+                            matches: &matches,
+                            active_match,
+                            link,
+                        };
+                        measured_renderer.paint(bounds, padding, &term, focused, &extras, window, cx);
 
                         // What the input method is composing, drawn at the cursor.
                         if let Some(text) = &marked_text {
@@ -1476,6 +1874,7 @@ impl Render for TerminalView {
                 )
                 .size_full(),
             )
+            .children(search_bar)
     }
 }
 

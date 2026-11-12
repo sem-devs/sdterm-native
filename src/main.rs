@@ -119,7 +119,7 @@ fn main() {
         // Before quitting: remember where each shell is, stop them, write the file.
         let on_quit = state.clone();
         cx.on_app_quit(move |cx| {
-            on_quit.update(cx, |state, _| state.shutdown());
+            on_quit.update(cx, |state, cx| state.shutdown(cx));
             async {}
         })
         .detach();

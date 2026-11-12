@@ -372,6 +372,23 @@ pub struct WindowBounds {
     pub y: f64,
     pub width: f64,
     pub height: f64,
+    /// The window was maximized (the other numbers are the size to go back to).
+    #[serde(default)]
+    pub maximized: bool,
+}
+
+impl WindowBounds {
+    /// Whether enough of this window is on one of the `displays` to grab it, so a monitor that is
+    /// no longer there never leaves a window out of reach.
+    pub fn is_reachable(&self, displays: &[WindowBounds]) -> bool {
+        self.width >= 200.0
+            && self.height >= 120.0
+            && displays.iter().any(|d| {
+                let w = (self.x + self.width).min(d.x + d.width) - self.x.max(d.x);
+                let h = (self.y + self.height).min(d.y + d.height) - self.y.max(d.y);
+                w >= 120.0 && h >= 60.0
+            })
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -501,5 +518,26 @@ mod tests {
     fn ids_are_unique() {
         let ids: std::collections::HashSet<_> = (0..1000).map(|_| new_id("p")).collect();
         assert_eq!(ids.len(), 1000);
+    }
+
+    #[test]
+    fn a_window_on_a_missing_monitor_is_not_reachable() {
+        let screen = WindowBounds { x: 0.0, y: 0.0, width: 1920.0, height: 1080.0, maximized: false };
+        let on_screen = WindowBounds { x: 100.0, y: 80.0, width: 1200.0, height: 800.0, maximized: false };
+        let far_right = WindowBounds { x: 3000.0, y: 100.0, width: 1200.0, height: 800.0, maximized: false };
+        let barely = WindowBounds { x: 1900.0, y: 100.0, width: 1200.0, height: 800.0, maximized: false };
+        let tiny = WindowBounds { x: 10.0, y: 10.0, width: 50.0, height: 50.0, maximized: false };
+        assert!(on_screen.is_reachable(&[screen]));
+        assert!(!far_right.is_reachable(&[screen]));
+        assert!(!barely.is_reachable(&[screen]));
+        assert!(!tiny.is_reachable(&[screen]));
+        assert!(far_right.is_reachable(&[screen, WindowBounds { x: 1920.0, width: 2560.0, ..screen }]));
+    }
+
+    #[test]
+    fn old_bounds_without_the_maximized_flag_still_load() {
+        let b: WindowBounds = serde_json::from_str(r#"{"x":10,"y":20,"width":800,"height":600}"#).unwrap();
+        assert!(!b.maximized);
+        assert_eq!(b.width, 800.0);
     }
 }

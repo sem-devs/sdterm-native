@@ -6,7 +6,7 @@ use std::time::Duration;
 use gpui::prelude::*;
 use gpui::{
     AnyWindowHandle, App, AppContext, Bounds, Context, Entity, FontWeight, Render, Subscription,
-    TitlebarOptions, Window, WindowBounds, WindowKind, WindowOptions, div, px, size,
+    TitlebarOptions, Window, WindowKind, WindowOptions, div, px, size,
 };
 use parking_lot::Mutex;
 
@@ -42,31 +42,55 @@ pub fn open(cx: &mut App, kind: WidgetKind, state: &Entity<AppState>) {
     let (width, height, min_height) = kind.size();
     let on_top = state.read(cx).data.settings.resources.popout_always_on_top;
     let feed = state.read(cx).resources.clone();
+    let key = format!("{kind:?}");
+    let saved = state.read(cx).data.widget_bounds.get(&key).copied();
+    let default = Bounds::centered(None, size(px(width), px(height)), cx);
     let options = WindowOptions {
         titlebar: Some(TitlebarOptions {
             title: Some(kind.label().into()),
             appears_transparent: false,
             traffic_light_position: None,
         }),
-        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(width), px(height)), cx))),
+        window_bounds: Some(crate::ui::opening_bounds(saved, default, cx)),
         kind: if on_top { WindowKind::PopUp } else { WindowKind::Normal },
         window_min_size: Some(size(px(240.), px(min_height))),
         ..Default::default()
     };
     let opened: Option<AnyWindowHandle> = if kind == WidgetKind::Processes {
         let state = state.clone();
-        cx.open_window(options, move |_, cx| cx.new(|cx| ProcessesView::new(state, cx))).ok().map(Into::into)
+        cx.open_window(options, move |window, cx| {
+            cx.new(|cx| {
+                watch_bounds(&state, key, window, cx);
+                ProcessesView::new(state.clone(), cx)
+            })
+        })
+        .ok()
+        .map(Into::into)
     } else {
         let state = state.clone();
-        cx.open_window(options, move |_, cx| cx.new(|cx| MonitorView::new(kind, feed, state, cx)))
-            .ok()
-            .map(Into::into)
+        cx.open_window(options, move |window, cx| {
+            cx.new(|cx| {
+                watch_bounds(&state, key, window, cx);
+                MonitorView::new(kind, feed, state.clone(), cx)
+            })
+        })
+        .ok()
+        .map(Into::into)
     };
     if let Some(handle) = opened {
         state.update(cx, |s, _| {
             s.widgets.insert(kind, handle);
         });
     }
+}
+
+/// Saves where a pop-out window is whenever it moves or is resized.
+fn watch_bounds<T: 'static>(state: &Entity<AppState>, key: String, window: &mut Window, cx: &mut Context<T>) {
+    let state = state.clone();
+    cx.observe_window_bounds(window, move |_, window, cx| {
+        crate::ui::remember_bounds(&state, true, &key, window, cx);
+    })
+    .detach();
 }
 
 // ---- Charts window -------------------------------------------------------------------------

@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use gpui::{AnyWindowHandle, AppContext, Context, Entity, Task};
+use gpui::{AnyWindowHandle, App, AppContext, Context, Entity, Task};
 
 use crate::metrics::WidgetKind;
 use crate::resources::ResourceFeed;
@@ -134,7 +134,7 @@ fn cwd_of(pid: u32) -> Option<PathBuf> {
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn cwd_of(_pid: u32) -> Option<PathBuf> {
-    None // Windows: shells report their folder with OSC 7 / OSC 9;9 (later)
+    None // Windows: PowerShell and cmd report their folder with OSC 9;9 (see session.rs)
 }
 
 impl AppState {
@@ -330,19 +330,20 @@ impl AppState {
         self._cwd_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(5)).await;
-                let Ok(pids) = this.update(cx, |state, _| state.pids()) else { break };
-                let found = cx
+                let Ok(pids) = this.update(cx, |state, cx| state.unreported_pids(cx)) else { break };
+                let looked_up = cx
                     .background_executor()
                     .spawn(async move {
                         pids.into_iter()
-                            .filter_map(|(id, pid)| cwd_of(pid).map(|dir| (id, dir)))
+                            .filter_map(|(id, pid)| cwd_of(pid).map(|dir| (id, dir.to_string_lossy().to_string())))
                             .collect::<Vec<_>>()
                     })
                     .await;
                 let updated = this.update(cx, |state, cx| {
                     let mut changed = false;
+                    // What a shell reports about itself wins over looking it up from outside.
+                    let found = looked_up.into_iter().chain(state.reported_cwds(cx));
                     for (id, dir) in found {
-                        let dir = dir.to_string_lossy().to_string();
                         if state.data.pane_cwds.get(&id) != Some(&dir) {
                             state.data.pane_cwds.insert(id, dir);
                             changed = true;
@@ -359,15 +360,29 @@ impl AppState {
         }));
     }
 
-    fn pids(&self) -> Vec<(String, u32)> {
-        self.sessions.iter().filter_map(|(id, s)| s.pid().map(|pid| (id.clone(), pid))).collect()
+    /// The shells whose folder has to be looked up from outside: the ones that do not report it
+    /// themselves (OSC 7 or OSC 9;9).
+    fn unreported_pids(&self, cx: &App) -> Vec<(String, u32)> {
+        self.sessions
+            .iter()
+            .filter(|(_, s)| s.view.read(cx).cwd().is_none())
+            .filter_map(|(id, s)| s.pid().map(|pid| (id.clone(), pid)))
+            .collect()
     }
 
-    fn snapshot_cwds(&mut self) {
-        for (id, pid) in self.pids() {
+    /// The folders the shells reported about themselves.
+    fn reported_cwds(&self, cx: &App) -> Vec<(String, String)> {
+        self.sessions.iter().filter_map(|(id, s)| s.view.read(cx).cwd().map(|dir| (id.clone(), dir))).collect()
+    }
+
+    fn snapshot_cwds(&mut self, cx: &App) {
+        for (id, pid) in self.unreported_pids(cx) {
             if let Some(dir) = cwd_of(pid) {
                 self.data.pane_cwds.insert(id, dir.to_string_lossy().to_string());
             }
+        }
+        for (id, dir) in self.reported_cwds(cx) {
+            self.data.pane_cwds.insert(id, dir);
         }
     }
 
@@ -392,8 +407,8 @@ impl AppState {
     }
 
     /// Before quitting: remember the folders, stop every shell, write the file.
-    pub fn shutdown(&mut self) {
-        self.snapshot_cwds();
+    pub fn shutdown(&mut self, cx: &App) {
+        self.snapshot_cwds(cx);
         let ids: Vec<String> = self.sessions.keys().cloned().collect();
         for id in ids {
             self.end_session(&id);
@@ -446,6 +461,16 @@ impl AppState {
                 view.set_option_as_meta(settings.option_as_meta);
                 view.set_copy_on_select(settings.copy_on_select);
             });
+        }
+    }
+
+    /// Remembers where a window is, so it opens there next time. `widget` is for the pop-out
+    /// windows (keyed by their kind), otherwise for the app windows (keyed by window id).
+    pub fn set_bounds(&mut self, widget: bool, key: &str, rect: crate::model::WindowBounds, cx: &mut Context<Self>) {
+        let map = if widget { &mut self.data.widget_bounds } else { &mut self.data.window_bounds };
+        if map.get(key) != Some(&rect) {
+            map.insert(key.to_string(), rect);
+            self.schedule_save(cx);
         }
     }
 
@@ -563,7 +588,7 @@ impl AppState {
     /// Parks a workspace: its shells stop, but names, notes, colors and folders are kept.
     pub fn set_parked(&mut self, id: &str, parked: bool, cx: &mut Context<Self>) {
         if parked {
-            self.snapshot_cwds();
+            self.snapshot_cwds(cx);
             let pane_ids: Vec<String> =
                 self.ws(id).map(|w| w.panes.iter().map(|p| p.id.clone()).collect()).unwrap_or_default();
             for pane in &pane_ids {

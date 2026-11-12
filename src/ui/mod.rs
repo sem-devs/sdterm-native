@@ -12,6 +12,7 @@ mod sidebar;
 mod summary;
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
@@ -19,7 +20,7 @@ use gpui::{
 };
 use gpui_terminal::TerminalView;
 
-use crate::model::{NetworkUnit, Settings, Workspace};
+use crate::model::{NetworkUnit, Settings, WindowBounds as SavedBounds, Workspace};
 use crate::resources::Sample;
 use crate::updater::UpdateStatus;
 use crate::state::{AppState, Edit, Menu, SettingsSection, View};
@@ -45,6 +46,62 @@ actions!(
         PopOutProcesses
     ]
 );
+
+/// The bounds a window opens with: where it was last if that is still on a display, otherwise
+/// `default`.
+pub(crate) fn opening_bounds(
+    saved: Option<SavedBounds>,
+    default: gpui::Bounds<gpui::Pixels>,
+    cx: &App,
+) -> gpui::WindowBounds {
+    use gpui::{Bounds, point, size};
+    let displays: Vec<SavedBounds> = cx
+        .displays()
+        .iter()
+        .map(|d| {
+            let b = d.bounds();
+            SavedBounds {
+                x: f32::from(b.origin.x) as f64,
+                y: f32::from(b.origin.y) as f64,
+                width: f32::from(b.size.width) as f64,
+                height: f32::from(b.size.height) as f64,
+                maximized: false,
+            }
+        })
+        .collect();
+    match saved.filter(|s| s.is_reachable(&displays)) {
+        Some(s) => {
+            let bounds = Bounds {
+                origin: point(px(s.x as f32), px(s.y as f32)),
+                size: size(px(s.width as f32), px(s.height as f32)),
+            };
+            if s.maximized {
+                gpui::WindowBounds::Maximized(bounds)
+            } else {
+                gpui::WindowBounds::Windowed(bounds)
+            }
+        }
+        None => gpui::WindowBounds::Windowed(default),
+    }
+}
+
+/// Saves where a window is (and whether it is maximized), so it opens there next time. `widget`
+/// is for the pop-out windows, keyed by their kind; app windows are keyed by their id.
+pub(crate) fn remember_bounds(state: &Entity<AppState>, widget: bool, key: &str, window: &Window, cx: &mut App) {
+    let (maximized, b) = match window.window_bounds() {
+        gpui::WindowBounds::Windowed(b) => (false, b),
+        gpui::WindowBounds::Maximized(b) => (true, b),
+        gpui::WindowBounds::Fullscreen(b) => (false, b),
+    };
+    let rect = SavedBounds {
+        x: f32::from(b.origin.x) as f64,
+        y: f32::from(b.origin.y) as f64,
+        width: f32::from(b.size.width) as f64,
+        height: f32::from(b.size.height) as f64,
+        maximized,
+    };
+    state.update(cx, |s, cx| s.set_bounds(widget, key, rect, cx));
+}
 
 pub(crate) const MAC: bool = cfg!(target_os = "macos");
 const UI_FONT: &str = ".SystemUIFont";
@@ -125,6 +182,8 @@ pub struct Root {
     focus_subs: HashMap<String, Subscription>,
     editor: Option<(Edit, Entity<TextInput>, Subscription)>,
     setting_inputs: HashMap<&'static str, (Entity<TextInput>, Subscription)>,
+    /// The window title last set, so it is only set again when it changes.
+    last_title: String,
     _observe: Subscription,
     _feed: Subscription,
 }
@@ -143,7 +202,54 @@ impl Root {
         })
         .detach();
         let _ = id;
-        Self { state, window_id, focus_subs: HashMap::new(), editor: None, setting_inputs: HashMap::new(), _observe, _feed }
+        // Where the window is, so the next launch puts it back.
+        cx.observe_window_bounds(window, |this, window, cx| {
+            remember_bounds(&this.state, false, &this.window_id, window, cx);
+        })
+        .detach();
+        // The title follows the terminal that has the focus (what its program sets).
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                if this.update_in(cx, |this, window, cx| this.sync_title(window, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+        Self {
+            state,
+            window_id,
+            focus_subs: HashMap::new(),
+            editor: None,
+            setting_inputs: HashMap::new(),
+            last_title: String::new(),
+            _observe,
+            _feed,
+        }
+    }
+
+    /// The window title: the workspace, and the title the program in its focused terminal set.
+    fn sync_title(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let title = {
+            let state = self.state.read(cx);
+            match state.active_of(&self.window_id) {
+                Some(ws) => {
+                    let program = ws
+                        .active_pane_id
+                        .as_ref()
+                        .and_then(|id| state.sessions.get(id))
+                        .map(|s| s.view.read(cx).title().trim().to_string())
+                        .unwrap_or_default();
+                    if program.is_empty() { ws.name.clone() } else { format!("{} \u{b7} {}", ws.name, program) }
+                }
+                None => "sdterm".to_string(),
+            }
+        };
+        if title != self.last_title {
+            window.set_window_title(&title);
+            self.last_title = title;
+        }
     }
 
     /// Makes this window the one actions apply to.
@@ -299,6 +405,7 @@ impl Root {
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_focus(window, cx);
+        self.sync_title(window, cx);
         self.sync_editor(window, cx);
         self.sync_setting_inputs(window, cx);
         let theme = cx.global::<Theme>().clone();
@@ -358,15 +465,17 @@ impl Render for Root {
 
 /// Opens an app window showing the workspaces assigned to `window_id`.
 pub fn open_app_window(cx: &mut App, state: &Entity<AppState>, window_id: String) {
-    use gpui::{AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, size};
+    use gpui::{AppContext, Bounds, TitlebarOptions, WindowOptions, point, size};
     state.update(cx, |s, _| s.register_window(&window_id));
+    let saved = state.read(cx).data.window_bounds.get(&window_id).copied();
+    let default = Bounds::centered(None, size(px(1280.), px(800.)), cx);
     let options = WindowOptions {
         titlebar: Some(TitlebarOptions {
             title: Some("sdterm".into()),
             appears_transparent: true,
             traffic_light_position: Some(point(px(14.), px(14.))),
         }),
-        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1280.), px(800.)), cx))),
+        window_bounds: Some(opening_bounds(saved, default, cx)),
         ..Default::default()
     };
     let (root_state, id) = (state.clone(), window_id.clone());

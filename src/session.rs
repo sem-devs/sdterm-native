@@ -113,6 +113,57 @@ fn suggestion_env(cmd: &mut CommandBuilder, shell: &str) {
     cmd.env("SDTERM_SUGGESTIONS", "1");
 }
 
+/// What PowerShell runs at startup, after the user's own profile: the prompt also tells sdterm the
+/// folder (OSC 9;9, the same sequence Windows Terminal uses), so a terminal comes back where it was.
+/// The original prompt runs first so a theme that looks at the result of the last command still
+/// sees it. With suggestions on, history predictions are turned on where PSReadLine has them.
+const POWERSHELL_INTEGRATION: &str = r#"
+$global:__sdterm_prompt = $function:prompt
+function global:prompt {
+    $shown = & $global:__sdterm_prompt
+    $where = $executionContext.SessionState.Path.CurrentLocation
+    if ($where.Provider.Name -eq 'FileSystem') {
+        $shown = "$([char]27)]9;9;`"$($where.ProviderPath)`"$([char]27)\$shown"
+    }
+    $shown
+}
+"#;
+
+const POWERSHELL_SUGGESTIONS: &str = r#"
+try { Set-PSReadLineOption -PredictionSource History } catch { }
+"#;
+
+/// The program name of a shell path without its folder and `.exe`, lower case. Both kinds of
+/// slash count, so a Windows path is read the same way everywhere.
+fn shell_name(shell: &str) -> String {
+    let file = shell.rsplit(['/', '\\']).next().unwrap_or("").to_ascii_lowercase();
+    file.strip_suffix(".exe").unwrap_or(&file).to_string()
+}
+
+/// The arguments that start PowerShell with the integration. It goes in as an encoded command
+/// (UTF-16 in base64), so no quoting can break it, and the profile still loads.
+fn powershell_args(shell: &str, suggestions: bool) -> Option<Vec<String>> {
+    use base64::Engine;
+    if !matches!(shell_name(shell).as_str(), "powershell" | "pwsh") {
+        return None;
+    }
+    let mut script = POWERSHELL_INTEGRATION.to_string();
+    if suggestions {
+        script.push_str(POWERSHELL_SUGGESTIONS);
+    }
+    let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    Some(vec![
+        "-NoLogo".into(),
+        "-NoExit".into(),
+        "-EncodedCommand".into(),
+        base64::engine::general_purpose::STANDARD.encode(utf16),
+    ])
+}
+
+/// cmd.exe reports its folder through the prompt string (OSC 9;9 wrapped around the usual `$P$G`).
+/// A prompt the user set themselves is left alone.
+const CMD_PROMPT: &str = "$E]9;9;$P$E\\$P$G";
+
 fn mono_font(settings: &TerminalSettings) -> String {
     let platform = if cfg!(target_os = "macos") {
         "Menlo"
@@ -142,6 +193,7 @@ pub fn terminal_config(settings: &TerminalSettings, theme: &Theme) -> TerminalCo
             CursorStyle::Bar => gpui_terminal::CursorShape::Beam,
             CursorStyle::Underline => gpui_terminal::CursorShape::Underline,
         },
+        cursor_blink: settings.cursor_blink,
         line_height_multiplier: settings.line_height as f32,
         padding: Edges::all(px(8.0)),
         colors: theme.terminal_palette(),
@@ -167,8 +219,13 @@ pub fn spawn(
 
     let shell = chosen_shell(&settings.shell);
     let mut cmd = CommandBuilder::new(&shell);
-    if !cfg!(windows) {
+    if let Some(args) = powershell_args(&shell, settings.suggestions) {
+        cmd.args(args);
+    } else if !cfg!(windows) {
         cmd.arg("-l"); // a login shell, like Terminal.app: PATH comes from the user's profile
+    }
+    if shell_name(&shell) == "cmd" && std::env::var_os("PROMPT").is_none() {
+        cmd.env("PROMPT", CMD_PROMPT);
     }
     for (key, _) in std::env::vars() {
         if is_launcher_var(&key) {
@@ -215,4 +272,33 @@ pub fn spawn(
             })
     });
     Ok(Session { view, child })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+
+    #[test]
+    fn powershell_gets_the_integration_as_an_encoded_command() {
+        let args = powershell_args(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", true).unwrap();
+        assert_eq!(&args[..3], ["-NoLogo", "-NoExit", "-EncodedCommand"]);
+        let bytes = base64::engine::general_purpose::STANDARD.decode(&args[3]).unwrap();
+        let units: Vec<u16> = bytes.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let script = String::from_utf16(&units).unwrap();
+        assert!(script.contains("function global:prompt"));
+        assert!(script.contains("]9;9;"));
+        assert!(script.contains("PredictionSource History"));
+        let without = powershell_args("pwsh", false).unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD.decode(&without[3]).unwrap();
+        let units: Vec<u16> = bytes.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        assert!(!String::from_utf16(&units).unwrap().contains("PredictionSource"));
+    }
+
+    #[test]
+    fn other_shells_are_left_alone() {
+        assert!(powershell_args("/bin/zsh", true).is_none());
+        assert!(powershell_args("cmd.exe", true).is_none());
+        assert_eq!(shell_name("C:\\Windows\\System32\\cmd.exe"), "cmd");
+    }
 }
