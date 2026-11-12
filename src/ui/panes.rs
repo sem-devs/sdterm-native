@@ -15,6 +15,7 @@ use super::{MAC, Snapshot};
 use crate::layout::{self, Axis, Node};
 use crate::model::{LAYOUTS, LayoutId, PANE_COLORS, Pane, PaneColor, Workspace};
 use crate::state::{AppState, Edit, Menu, View, pane_label};
+use crate::updater::UpdateStatus;
 use crate::theme::Theme;
 
 pub fn main_area(snap: Snapshot, theme: &Theme, state: &Entity<AppState>) -> AnyElement {
@@ -106,8 +107,63 @@ pub fn main_area(snap: Snapshot, theme: &Theme, state: &Entity<AppState>) -> Any
         .flex()
         .flex_col()
         .child(bar)
+        .children(update_banner(&snap, theme, state))
         .child(div().flex_1().min_h(px(0.)).child(body))
         .into_any_element()
+}
+
+/// Tells you a new version is out. It sits under the title bar, in the first window only.
+fn update_banner(snap: &Snapshot, theme: &Theme, state: &Entity<AppState>) -> Option<AnyElement> {
+    if !snap.shows_update {
+        return None;
+    }
+    let (message, actions): (String, Vec<AnyElement>) = match &snap.update {
+        UpdateStatus::Available { version, .. } => {
+            let (install, later) = (state.clone(), state.clone());
+            let label = if cfg!(target_os = "macos") { "Update and restart" } else { "Download" };
+            (
+                format!("sdterm {version} is available."),
+                vec![
+                    text_button("update-now", label, theme, true, move |cx| {
+                        install.update(cx, |s, cx| s.install_update(cx))
+                    })
+                    .into_any_element(),
+                    text_button("update-later", "Later", theme, false, move |cx| {
+                        later.update(cx, |s, cx| s.dismiss_update(cx))
+                    })
+                    .into_any_element(),
+                ],
+            )
+        }
+        UpdateStatus::Downloading(n) => (format!("Downloading the update: {n}%"), vec![]),
+        UpdateStatus::Error(message) => {
+            let dismiss = state.clone();
+            (
+                format!("The update did not work: {message}"),
+                vec![text_button("update-dismiss", "Dismiss", theme, false, move |cx| {
+                    dismiss.update(cx, |s, cx| s.dismiss_update(cx))
+                })
+                .into_any_element()],
+            )
+        }
+        _ => return None,
+    };
+    Some(
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .h(px(40.))
+            .px_4()
+            .bg(theme.primary.opacity(0.12))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(div().min_w(px(0.)).truncate().child(message))
+            .child(div().flex().flex_none().gap_2().children(actions))
+            .into_any_element(),
+    )
 }
 
 // ---- Layout menu ---------------------------------------------------------------------------

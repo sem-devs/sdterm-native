@@ -377,7 +377,30 @@ fn resources(snap: &Snapshot, theme: &Theme, state: &Entity<AppState>) -> AnyEle
 }
 
 fn updates(snap: &Snapshot, theme: &Theme, state: &Entity<AppState>) -> AnyElement {
+    use crate::updater::UpdateStatus;
     let s = &snap.settings;
+    let status = match &snap.update {
+        UpdateStatus::Idle => "Not checked yet.".to_string(),
+        UpdateStatus::Checking => "Checking…".to_string(),
+        UpdateStatus::UpToDate => "You are up to date.".to_string(),
+        UpdateStatus::Available { version, .. } => format!("Version {version} is available."),
+        UpdateStatus::Downloading(n) => format!("Downloading the update: {n}%"),
+        UpdateStatus::Error(message) => format!("The check did not work: {message}"),
+    };
+    let check = state.clone();
+    let mut actions = div().flex().items_center().gap_2().child(text_button("check-now", "Check now", theme, false, move |cx| {
+        check.update(cx, |s, cx| s.check_for_update(true, cx))
+    }));
+    if matches!(snap.update, UpdateStatus::Available { .. }) {
+        let install = state.clone();
+        actions = actions.child(text_button(
+            "install-now",
+            if cfg!(target_os = "macos") { "Update and restart" } else { "Download" },
+            theme,
+            true,
+            move |cx| install.update(cx, |s, cx| s.install_update(cx)),
+        ));
+    }
     div()
         .child(section(
             theme,
@@ -390,15 +413,19 @@ fn updates(snap: &Snapshot, theme: &Theme, state: &Entity<AppState>) -> AnyEleme
                     None,
                     on_off("auto-check", s.updates.auto_check, theme, state, |s, v| s.updates.auto_check = v),
                 ),
-                row(
-                    theme,
-                    "Version",
-                    Some("This is the version you are running."),
-                    div().font_weight(FontWeight::MEDIUM).child(format!("{VERSION}")),
-                ),
+                row(theme, "Version", Some("This is the version you are running."), div().font_weight(FontWeight::MEDIUM).child(VERSION.to_string())),
+                row(theme, "Status", Some(status_hint()), div().flex().flex_col().items_end().gap_2().child(div().text_color(theme.muted_foreground).child(status)).child(actions)),
             ],
         ))
         .into_any_element()
+}
+
+fn status_hint() -> &'static str {
+    if cfg!(debug_assertions) {
+        "This is a development build, so it does not look for updates on its own."
+    } else {
+        "sdterm looks at startup and every few hours."
+    }
 }
 
 fn shortcuts(theme: &Theme) -> AnyElement {

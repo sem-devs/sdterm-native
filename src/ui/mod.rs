@@ -21,6 +21,7 @@ use gpui_terminal::TerminalView;
 
 use crate::model::{NetworkUnit, Settings, Workspace};
 use crate::resources::Sample;
+use crate::updater::UpdateStatus;
 use crate::state::{AppState, Edit, Menu, SettingsSection, View};
 use crate::text_input::{InputEvent, TextInput};
 use crate::theme::Theme;
@@ -54,6 +55,9 @@ pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) struct Snapshot {
     pub window_id: String,
     pub open_windows: Vec<String>,
+    pub update: UpdateStatus,
+    /// The window that shows the update banner: the first one.
+    pub shows_update: bool,
     pub sidebar_collapsed: bool,
     pub view: View,
     pub show_parked: bool,
@@ -97,6 +101,8 @@ impl Snapshot {
             workspaces: state.mine_of(window_id).into_iter().cloned().collect(),
             active: state.active_of(window_id).cloned(),
             open_windows: state.open_windows.clone(),
+            update: state.update.clone(),
+            shows_update: state.open_windows.first().map_or(true, |w| w == window_id),
             views,
             focused,
             menu: if state.menu_owner == window_id { state.menu.clone() } else { None },

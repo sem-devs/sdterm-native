@@ -10,6 +10,7 @@ mod session;
 mod state;
 mod store;
 mod text_input;
+mod updater;
 mod theme;
 mod ui;
 
@@ -32,6 +33,7 @@ fn main() {
         cx.set_global(Theme::for_mode(mode, system_dark));
 
         let state = cx.new(AppState::new);
+        state.update(cx, |s, cx| s.schedule_update_checks(cx));
 
         // Cmd on a Mac. Elsewhere plain Ctrl+T/W/N belong to the shell, so the shortcuts use
         // Ctrl+Shift there.

@@ -16,6 +16,7 @@ use crate::model::{
     LayoutId, PANE_COLORS, Pane, PaneColor, PersistedWorkspaces, Settings, StoreData, Workspace, new_id,
 };
 use crate::session::{self, Session};
+use crate::updater::{self, Offer, UpdateStatus};
 use crate::store;
 use crate::theme::Theme;
 
@@ -85,6 +86,8 @@ pub struct AppState {
     pub widgets: HashMap<WidgetKind, AnyWindowHandle>,
     pub settings_section: SettingsSection,
     pub show_parked: bool,
+    pub update: UpdateStatus,
+    offer: Option<Offer>,
     pub confirm_reset: bool,
     pub editing: Option<Edit>,
     pub menu: Option<Menu>,
@@ -172,6 +175,8 @@ impl AppState {
             widgets: HashMap::new(),
             settings_section: SettingsSection::Appearance,
             show_parked: false,
+            update: UpdateStatus::Idle,
+            offer: None,
             confirm_reset: false,
             editing: None,
             menu: None,
@@ -612,6 +617,133 @@ impl AppState {
             ids.push("main".to_string());
         }
         ids
+    }
+
+    // ---- Updates ------------------------------------------------------------------------
+
+    /// Looks for a new version now. A check you did not ask for stays quiet when it fails.
+    pub fn check_for_update(&mut self, manual: bool, cx: &mut Context<Self>) {
+        if !updater::enabled() {
+            if manual {
+                self.update = UpdateStatus::Error("Updates are off in a development build.".into());
+                cx.notify();
+            }
+            return;
+        }
+        if matches!(self.update, UpdateStatus::Checking | UpdateStatus::Downloading(_)) {
+            return;
+        }
+        self.update = UpdateStatus::Checking;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { updater::check(&updater::feed_base()) })
+                .await;
+            this.update(cx, |state, cx| {
+                match result {
+                    Ok(Some(offer)) => {
+                        state.update = UpdateStatus::Available {
+                            version: offer.version.clone(),
+                            notes: offer.notes.clone(),
+                        };
+                        state.offer = Some(offer);
+                    }
+                    Ok(None) => state.update = UpdateStatus::UpToDate,
+                    Err(err) if manual => state.update = UpdateStatus::Error(format!("{err:#}")),
+                    Err(_) => state.update = UpdateStatus::Idle,
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Checks at startup and every few hours while the app is open.
+    pub fn schedule_update_checks(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(10)).await;
+            loop {
+                let again = this.update(cx, |state, cx| {
+                    if state.data.settings.updates.auto_check {
+                        state.check_for_update(false, cx);
+                    }
+                });
+                if again.is_err() {
+                    break;
+                }
+                cx.background_executor().timer(Duration::from_secs(6 * 60 * 60)).await;
+            }
+        })
+        .detach();
+    }
+
+    /// Downloads the new version, installs it and restarts. On Windows and Linux it opens the
+    /// download page instead.
+    pub fn install_update(&mut self, cx: &mut Context<Self>) {
+        let Some(offer) = self.offer.clone() else { return };
+        if !cfg!(target_os = "macos") {
+            cx.open_url(updater::DOWNLOAD_PAGE);
+            return;
+        }
+        self.update = UpdateStatus::Downloading(0);
+        cx.notify();
+        let percent = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // The download runs in the background and reports into a number; this loop shows it.
+        let (p, f) = (percent.clone(), finished.clone());
+        cx.spawn(async move |this, cx| {
+            while !f.load(std::sync::atomic::Ordering::Relaxed) {
+                cx.background_executor().timer(Duration::from_millis(250)).await;
+                let n = p.load(std::sync::atomic::Ordering::Relaxed);
+                if this
+                    .update(cx, |state, cx| {
+                        if matches!(state.update, UpdateStatus::Downloading(_)) {
+                            state.update = UpdateStatus::Downloading(n);
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        let (p, f) = (percent, finished);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let zip = updater::download(&offer, |n| p.store(n, std::sync::atomic::Ordering::Relaxed))?;
+                    updater::install_mac(&zip)
+                })
+                .await;
+            f.store(true, std::sync::atomic::Ordering::Relaxed);
+            this.update(cx, |state, cx| match result {
+                Ok(()) => {
+                    // The swap script waits for this process to end, then reopens the new app.
+                    state.quitting = true;
+                    cx.quit();
+                }
+                Err(err) => {
+                    state.update = UpdateStatus::Error(format!("{err:#}"));
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn dismiss_update(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.update, UpdateStatus::Available { .. } | UpdateStatus::Error(_)) {
+            self.update = UpdateStatus::Idle;
+            cx.notify();
+        }
     }
 
     // ---- Windows ------------------------------------------------------------------------
