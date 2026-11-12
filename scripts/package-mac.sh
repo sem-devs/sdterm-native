@@ -65,13 +65,17 @@ for ARCH in $ARCHS; do
   xcrun notarytool submit "$DMG" --keychain-profile "$PROFILE" --wait
   xcrun stapler staple "$DMG"
 
-  SHA=$(openssl dgst -sha512 -binary "$ZIP" | base64)
-  SIZE=$(stat -f %z "$ZIP")
-  FEED_FILES+=("{\"arch\":\"$ARCH\",\"url\":\"$NAME.zip\",\"sha512\":\"$SHA\",\"size\":$SIZE}")
   rm -rf "$WORK"
 done
 
-# The feed the updater reads.
+# The feed the updater reads: every architecture that has a zip in this folder.
+FEED_FILES=()
+for ZIP in "$OUT"/sdterm-native-$VERSION-mac-*.zip(N); do
+  FILE=${ZIP:t}
+  ARCH=${${FILE%.zip}##*-}
+  SHA=$(openssl dgst -sha512 -binary "$ZIP" | base64)
+  FEED_FILES+=("{\"arch\":\"$ARCH\",\"url\":\"$FILE\",\"sha512\":\"$SHA\",\"size\":$(stat -f %z "$ZIP")}")
+done
 NOTES=${SDTERM_RELEASE_NOTES:-}
 printf '{"version":"%s","notes":"%s","releaseDate":"%s","files":[%s]}\n' \
   "$VERSION" "$NOTES" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${(j:,:)FEED_FILES}" > "$OUT/latest-mac.json"

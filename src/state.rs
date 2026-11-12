@@ -648,6 +648,10 @@ impl AppState {
                             notes: offer.notes.clone(),
                         };
                         state.offer = Some(offer);
+                        // For testing the whole update by machine: install as soon as one is found.
+                        if std::env::var_os("SDTERM_UPDATE_AUTOINSTALL").is_some() {
+                            state.install_update(cx);
+                        }
                     }
                     Ok(None) => state.update = UpdateStatus::UpToDate,
                     Err(err) if manual => state.update = UpdateStatus::Error(format!("{err:#}")),
