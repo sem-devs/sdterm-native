@@ -35,15 +35,26 @@ own file next to it and never writes to the other one.
 
 Downloads are on the [SEM Devs website](https://sem-devs.com/sdterm).
 
-| System            | Download                                          |
-| ----------------- | ------------------------------------------------- |
-| macOS 12 or later | `.dmg`, Apple Silicon and Intel, available now    |
-| Windows 10 and 11 | coming soon, being tested                         |
-| Linux             | coming soon, being tested                         |
+| System            | Download                                                                   |
+| ----------------- | -------------------------------------------------------------------------- |
+| macOS 12 or later | `.dmg`, Apple Silicon and Intel, available now                             |
+| Windows 10 and 11 | `-win-x64-setup.exe` installer, or a plain `.zip` (x64), being tested      |
+| Linux (x86_64)    | `.AppImage`, `.deb` or `.tar.gz`, being tested                             |
 
 The macOS app is signed by SEM Devs and notarized by Apple. The Windows and Linux builds are made
 by the workflow in `.github/workflows/build.yml` and are published once they have run on real
 machines.
+
+**Windows.** The setup installs for your user only (no administrator prompt) into
+`%LOCALAPPDATA%\Programs\sdterm native`, adds a Start menu shortcut and an entry in "Apps and
+features". The files are not code signed (we have no Windows certificate), so SmartScreen may warn the
+first time: click "More info", then "Run anyway". The plain `.zip` runs from any folder and does not
+update itself.
+
+**Linux.** The AppImage is one file: make it executable and run it (`chmod +x` then
+`./sdterm-native-*.AppImage`). It updates itself in place. The `.deb` (`sudo apt install ./file.deb`)
+and the `.tar.gz` send you to the download page when a new version is out. The program needs the
+usual desktop libraries (Wayland or X11, Vulkan, fontconfig, xkbcommon), which any desktop install has.
 
 ## Build it yourself
 
