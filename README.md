@@ -38,12 +38,12 @@ Downloads are on the [SEM Devs website](https://sem-devs.com/sdterm).
 | System            | Download                                                                   |
 | ----------------- | -------------------------------------------------------------------------- |
 | macOS 12 or later | `.dmg`, Apple Silicon and Intel, available now                             |
-| Windows 10 and 11 | `-win-x64-setup.exe` installer, or a plain `.zip` (x64), being tested      |
-| Linux (x86_64)    | `.AppImage`, `.deb` or `.tar.gz`, being tested                             |
+| Windows 10 and 11 | `-win-x64-setup.exe` installer, or a plain `.zip` (x64), preview           |
+| Linux (x86_64)    | `.AppImage`, `.deb` or `.tar.gz`, preview                                  |
 
 The macOS app is signed by SEM Devs and notarized by Apple. The Windows and Linux builds are made
-by the workflow in `.github/workflows/build.yml` and are published once they have run on real
-machines.
+by the workflow in `.github/workflows/build.yml`. They are a preview: they build and pass the tests
+on Windows and Linux runners, but have had little use on real machines yet.
 
 **Windows.** The setup installs for your user only (no administrator prompt) into
 `%LOCALAPPDATA%\Programs\sdterm native`, adds a Start menu shortcut and an entry in "Apps and
