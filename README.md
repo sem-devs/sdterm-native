@@ -52,7 +52,8 @@ first time: click "More info", then "Run anyway". The plain `.zip` runs from any
 update itself.
 
 **Linux.** The AppImage is one file: make it executable and run it (`chmod +x` then
-`./sdterm-native-*.AppImage`). It updates itself in place. The `.deb` (`sudo apt install ./file.deb`)
+`./sdterm-native-*.AppImage`; if it does not start, FUSE is missing on your system: run it with
+`--appimage-extract-and-run`). It updates itself in place. The `.deb` (`sudo apt install ./file.deb`)
 and the `.tar.gz` send you to the download page when a new version is out. The program needs the
 usual desktop libraries (Wayland or X11, Vulkan, fontconfig, xkbcommon), which any desktop install has.
 
