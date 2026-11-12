@@ -1,12 +1,17 @@
 name: Build
 
-# Tests everywhere and builds the Linux and Windows downloads. The macOS app is built, signed and
-# notarized on a Mac with scripts/package-mac.sh, because that needs the Developer ID certificate.
+# Tests everywhere and builds the Linux and Windows downloads: the installer (Windows), the AppImage,
+# .deb and .tar.gz (Linux), the plain .zip, the update feeds (latest-win.json, latest-linux.json) and
+# the checksums. The macOS app is built, signed and notarized on a Mac with scripts/package-mac.sh,
+# because that needs the Developer ID certificate.
 # Run it by hand (Actions, Build) or push a tag like v0.1.0.
 on:
   workflow_dispatch:
   push:
     tags: ['v*']
+
+permissions:
+  contents: read
 
 jobs:
   linux:
@@ -24,31 +29,18 @@ jobs:
             libssl-dev libzstd-dev libgit2-dev
       - run: cargo test --release
       - run: cargo build --release
-      - name: Package
-        run: |
-          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          NAME=sdterm-native-$VERSION-linux-x86_64
-          mkdir -p dist/$NAME/resources
-          cp target/release/sdterm-native dist/$NAME/
-          cp -R resources/shell dist/$NAME/resources/shell
-          cp LICENSE README.md dist/$NAME/
-          tar -C dist -czf dist/$NAME.tar.gz $NAME
-          # A .deb: the program and its files under /usr/lib, a launcher in /usr/bin.
-          DEB=dist/deb
-          mkdir -p $DEB/DEBIAN $DEB/usr/lib/sdterm-native/resources $DEB/usr/bin $DEB/usr/share/applications
-          cp target/release/sdterm-native $DEB/usr/lib/sdterm-native/
-          cp -R resources/shell $DEB/usr/lib/sdterm-native/resources/shell
-          ln -s /usr/lib/sdterm-native/sdterm-native $DEB/usr/bin/sdterm-native
-          printf '[Desktop Entry]\nName=sdterm native\nComment=A terminal workspace\nExec=sdterm-native\nTerminal=false\nType=Application\nCategories=System;TerminalEmulator;\n' > $DEB/usr/share/applications/sdterm-native.desktop
-          printf 'Package: sdterm-native\nVersion: %s\nSection: utils\nPriority: optional\nArchitecture: amd64\nMaintainer: SEM Devs <info@sem-devs.com>\nDescription: A terminal workspace\n Many terminals in one window, each with a name, a note and a color, with live resource monitors.\n' "$VERSION" > $DEB/DEBIAN/control
-          dpkg-deb --build $DEB dist/sdterm-native-$VERSION-linux-amd64.deb
-          (cd dist && sha256sum *.tar.gz *.deb > SHA256SUMS-linux.txt)
+      - name: Libraries the program needs at run time
+        run: ldd target/release/sdterm-native
+      - name: Package (tar.gz, deb, AppImage, feed)
+        run: scripts/package-linux.sh
       - uses: actions/upload-artifact@v4
         with:
           name: sdterm-native-linux
           path: |
             dist/*.tar.gz
             dist/*.deb
+            dist/*.AppImage
+            dist/latest-linux.json
             dist/SHA256SUMS-linux.txt
 
   windows:
@@ -59,22 +51,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --release
       - run: cargo build --release
-      - name: Package
+      - name: Package (installer, zip, feed)
         shell: pwsh
-        run: |
-          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
-          $name = "sdterm-native-$version-windows-x64"
-          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
-          Copy-Item target/release/sdterm-native.exe "dist/$name/"
-          Copy-Item LICENSE, README.md "dist/$name/"
-          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip" -Force
-          (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash + "  $name.zip" | Out-File dist/SHA256SUMS-windows.txt
+        run: ./scripts/package-windows.ps1
       - uses: actions/upload-artifact@v4
         with:
           name: sdterm-native-windows
           path: |
+            dist/*.exe
             dist/*.zip
-            dist/SHA256SUMS-windows.txt
+            dist/latest-win.json
+            dist/SHA256SUMS-win.txt
 
   macos-tests:
     runs-on: macos-latest
