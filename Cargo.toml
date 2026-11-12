@@ -24,3 +24,8 @@ ureq = "3.5.1"
 lto = "thin"
 strip = true
 codegen-units = 4
+
+# xattr 0.2.3 (pulled in by GPUI) does not build on Linux with a current libc: the patched copy uses
+# ENODATA there. Remove once GPUI moves to a newer xattr.
+[patch.crates-io]
+xattr = { path = "crates/xattr" }

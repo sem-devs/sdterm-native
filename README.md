@@ -33,16 +33,17 @@ own file next to it and never writes to the other one.
 
 ## Install
 
-Downloads are on the [SEM Devs website](https://sem-devs.com/en/sdterm) and on the
-[releases page](https://github.com/sem-devs/sdterm-native/releases).
+Downloads are on the [SEM Devs website](https://sem-devs.com/sdterm).
 
-| System            | Download                         |
-| ----------------- | -------------------------------- |
-| macOS 12 or later | `.dmg`, Apple Silicon and Intel  |
-| Windows 10 and 11 | `.zip` (x64)                     |
-| Linux             | `.tar.gz` and `.deb` (x86_64)    |
+| System            | Download                                          |
+| ----------------- | ------------------------------------------------- |
+| macOS 12 or later | `.dmg`, Apple Silicon and Intel, available now    |
+| Windows 10 and 11 | coming soon, being tested                         |
+| Linux             | coming soon, being tested                         |
 
-The macOS app is signed by SEM Devs and notarized by Apple.
+The macOS app is signed by SEM Devs and notarized by Apple. The Windows and Linux builds are made
+by the workflow in `.github/workflows/build.yml` and are published once they have run on real
+machines.
 
 ## Build it yourself
 
