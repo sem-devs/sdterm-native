@@ -2,6 +2,10 @@
 //! to find out how GPUI + alacritty_terminal + portable-pty feel on this machine before building
 //! the rest of the app.
 
+mod layout;
+mod model;
+mod store;
+
 use std::sync::Arc;
 
 use anyhow::Result;
