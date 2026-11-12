@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=sdterm native
+GenericName=Terminal workspace
+Comment=Many terminals in one window, each with a name, a note and a color
+Exec=sdterm-native
+Icon=sdterm-native
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;console;command;
