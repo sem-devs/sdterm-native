@@ -23,6 +23,23 @@ pub enum View {
     Settings,
 }
 
+/// Something being renamed or written in place.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Edit {
+    WorkspaceName(String),
+    PaneName(String),
+    PaneNote(String),
+}
+
+/// A small menu that is open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Menu {
+    Layout,
+    Workspace(String),
+    ConfirmDelete(String),
+    PaneColor(String),
+}
+
 pub struct AppState {
     pub data: StoreData,
     /// This window's id: "main", "w2", ...
@@ -32,6 +49,8 @@ pub struct AppState {
     pub view: View,
     pub sidebar_collapsed: bool,
     pub show_parked: bool,
+    pub editing: Option<Edit>,
+    pub menu: Option<Menu>,
     /// A terminal that should get the keyboard focus on the next frame.
     pub pending_focus: Option<String>,
     /// What happened while loading the data file, for the log.
@@ -108,6 +127,8 @@ impl AppState {
             view: View::Terminals,
             sidebar_collapsed: false,
             show_parked: false,
+            editing: None,
+            menu: None,
             pending_focus: None,
             load_note: loaded.note,
             save_task: None,
@@ -313,6 +334,52 @@ impl AppState {
         cx.notify();
     }
 
+    pub fn begin_edit(&mut self, edit: Edit, cx: &mut Context<Self>) {
+        self.menu = None;
+        self.editing = Some(edit);
+        cx.notify();
+    }
+
+    /// Ends an edit. `refocus` hands the keyboard back to the terminal (after Enter or Escape, not
+    /// when the user clicked somewhere else on purpose).
+    pub fn end_edit(&mut self, refocus: bool, cx: &mut Context<Self>) {
+        self.editing = None;
+        if refocus {
+            if let Some(pane) = self.active().and_then(|w| w.active_pane_id.clone()) {
+                self.pending_focus = Some(pane);
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_menu(&mut self, menu: Menu, cx: &mut Context<Self>) {
+        self.editing = None;
+        self.menu = if self.menu.as_ref() == Some(&menu) { None } else { Some(menu) };
+        cx.notify();
+    }
+
+    pub fn open_menu(&mut self, menu: Menu, cx: &mut Context<Self>) {
+        self.menu = Some(menu);
+        cx.notify();
+    }
+
+    pub fn close_menu(&mut self, cx: &mut Context<Self>) {
+        if self.menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The folder a terminal's shell is in, or its workspace's folder.
+    pub fn pane_folder(&self, pane_id: &str) -> Option<PathBuf> {
+        let remembered = self.data.pane_cwds.get(pane_id).filter(|d| is_dir(d)).map(PathBuf::from);
+        remembered.or_else(|| {
+            self.find_pane(pane_id)
+                .map(|(w, _)| w.folder.clone())
+                .filter(|d| is_dir(d))
+                .map(PathBuf::from)
+        })
+    }
+
     pub fn toggle_parked_list(&mut self, cx: &mut Context<Self>) {
         self.show_parked = !self.show_parked;
         cx.notify();
@@ -326,6 +393,7 @@ impl AppState {
             .active_by_window
             .insert(window, id.to_string());
         self.view = View::Terminals;
+        self.menu = None;
         if let Some(pane) = self.ws(id).and_then(|w| w.active_pane_id.clone()) {
             self.pending_focus = Some(pane);
         }
@@ -397,6 +465,14 @@ impl AppState {
     pub fn set_split(&mut self, id: &str, split: f64, cx: &mut Context<Self>) {
         if let Some(ws) = self.ws_mut(id) {
             ws.split = Some(split.clamp(0.2, 0.8));
+            self.changed(cx);
+        }
+    }
+
+    /// Back to the layout's own proportions (double-clicking the divider).
+    pub fn reset_split(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(ws) = self.ws_mut(id) {
+            ws.split = None;
             self.changed(cx);
         }
     }

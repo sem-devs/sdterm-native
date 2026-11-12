@@ -5,6 +5,7 @@ mod model;
 mod session;
 mod state;
 mod store;
+mod text_input;
 mod theme;
 mod ui;
 
