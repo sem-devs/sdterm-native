@@ -155,7 +155,7 @@ pub fn stepper(
             .cursor_pointer()
             .bg(theme.muted)
             .hover(move |s| s.bg(hover))
-            .child(icon(glyph, 14.))
+            .child(icon(glyph, 14., theme.foreground))
             .on_click(move |_, _, cx| f(cx))
     };
     div()

@@ -56,7 +56,7 @@ pub fn settings_view(snap: &Snapshot, theme: &Theme, state: &Entity<AppState>) -
             .cursor_pointer()
             .text_color(theme.foreground)
             .hover(move |s| s.bg(back_hover))
-            .child(icon(Icon::ArrowLeft, 16.))
+            .child(icon(Icon::ArrowLeft, 16., theme.foreground))
             .child("Terminals")
             .on_click(move |_, _, cx| back_state.update(cx, |s, cx| s.set_view(View::Terminals, cx))),
     );

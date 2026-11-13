@@ -8,7 +8,7 @@ use gpui::{
 use gpui_terminal::TerminalView;
 
 use super::parts::{
-    DividerDrag, DragGhost, Icon, NoGhost, PaneDrag, color_chip, icon, icon_button, menu_panel,
+    DividerDrag, DragGhost, Icon, NoGhost, PaneDrag, color_chip, icon, icon_button, icon_hover, menu_panel,
     mini_icon_button, mix, overlay, text_button, tip,
 };
 use super::{MAC, Snapshot, shortcut};
@@ -215,9 +215,10 @@ fn layout_button(active: &Workspace, snap: &Snapshot, theme: &Theme, state: &Ent
         .cursor_pointer()
         .text_size(px(12.))
         .text_color(theme.muted_foreground)
+        .group("layout-button")
         .hover(move |s| s.bg(bg).text_color(fg))
         .tooltip(tip("Arrange terminals"))
-        .child(icon(Icon::SquaresFour, 16.))
+        .child(icon_hover(Icon::SquaresFour, 16., theme.muted_foreground, fg, "layout-button"))
         .child(active.layout.label())
         .on_click(move |_, _, cx| toggle.update(cx, |s, cx| s.toggle_menu(Menu::Layout, cx)));
 
@@ -291,7 +292,7 @@ fn empty_state(
         .items_start()
         .gap_4()
         .px(px(64.))
-        .child(div().text_color(theme.muted_foreground).child(icon(Icon::TerminalWindow, 32.)))
+        .child(icon(Icon::TerminalWindow, 32., theme.muted_foreground))
         .child(
             div()
                 .flex()
@@ -360,7 +361,7 @@ fn parked_view(ws: &Workspace, snap: &Snapshot, theme: &Theme, state: &Entity<Ap
         .bg(primary)
         .text_color(primary_fg)
         .hover(move |s| s.bg(primary.opacity(0.85)))
-        .child(icon(Icon::Play, 14.))
+        .child(icon(Icon::Play, 14., primary_fg))
         .child(format!("Launch {count} {}", if count == 1 { "terminal" } else { "terminals" }))
         .on_click(move |_, _, cx| {
             if count > 0 {
@@ -428,7 +429,7 @@ fn details_editor(
                 .cursor_pointer()
                 .hover(move |s| s.bg(hover))
                 .tooltip(tip("No color"))
-                .child(icon(Icon::Prohibit, 14.))
+                .child(icon(Icon::Prohibit, 14., if none { fg } else { muted }))
                 .on_click(move |_, _, cx| state.update(cx, |s, cx| s.set_pane_color(&id, None, cx))),
         );
     }
@@ -613,6 +614,7 @@ fn open_slot(theme: &Theme, state: &Entity<AppState>, n: usize) -> AnyElement {
         .child(
             div()
                 .id(("open-slot", n))
+                .group("open-slot")
                 .size_full()
                 .flex()
                 .flex_col()
@@ -626,7 +628,7 @@ fn open_slot(theme: &Theme, state: &Entity<AppState>, n: usize) -> AnyElement {
                 .cursor_pointer()
                 .text_color(muted)
                 .hover(move |s| s.text_color(fg))
-                .child(icon(Icon::Plus, 20.))
+                .child(icon_hover(Icon::Plus, 20., muted, fg, "open-slot"))
                 .child("New terminal")
                 .on_click(move |_, _, cx| state.update(cx, |s, cx| s.add_pane(cx))),
         )

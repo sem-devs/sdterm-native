@@ -1,6 +1,6 @@
 [package]
 name = "sdterm-native"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 
 [dependencies]
@@ -32,3 +32,7 @@ codegen-units = 4
 # ENODATA there. Remove once GPUI moves to a newer xattr.
 [patch.crates-io]
 xattr = { path = "crates/xattr" }
+
+[dev-dependencies]
+# The same SVG engine GPUI draws icons with, to check that the bundled icons really render.
+resvg = "0.45.1"

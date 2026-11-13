@@ -5,7 +5,7 @@ use gpui::{AnyElement, Entity, FontWeight, div, px};
 
 use super::Snapshot;
 use super::charts::chart;
-use super::parts::{Icon, icon, tip};
+use super::parts::{Icon, icon_hover, tip};
 use crate::metrics::{Metric, WidgetKind};
 use crate::monitors;
 use crate::resources::Sample;
@@ -48,6 +48,7 @@ fn row(
         .child(
             div()
                 .id((label, 1usize))
+                .group("pop-out")
                 .flex()
                 .flex_none()
                 .items_center()
@@ -60,7 +61,7 @@ fn row(
                 .group_hover("res-row", |s| s.opacity(1.0))
                 .hover(move |s| s.text_color(fg))
                 .tooltip(tip("Open in its own window"))
-                .child(icon(Icon::ArrowSquareOut, 14.))
+                .child(icon_hover(Icon::ArrowSquareOut, 14., muted, fg, "pop-out"))
                 .on_click(move |_, _, cx| monitors::open(cx, kind, &state)),
         )
         .into_any_element()
@@ -124,13 +125,14 @@ pub fn resources_summary(theme: &Theme, snap: &Snapshot, state: &Entity<AppState
                         .child(
                             div()
                                 .id("open-summary")
+                                .group("pop-out-all")
                                 .px_1p5()
                                 .rounded_sm()
                                 .cursor_pointer()
                                 .text_color(muted)
                                 .hover(move |s| s.text_color(fg))
                                 .tooltip(tip("Open all in one window"))
-                                .child(icon(Icon::ArrowSquareOut, 14.))
+                                .child(icon_hover(Icon::ArrowSquareOut, 14., muted, fg, "pop-out-all"))
                                 .on_click(move |_, _, cx| {
                                     monitors::open(cx, WidgetKind::Summary, &summary_state)
                                 }),

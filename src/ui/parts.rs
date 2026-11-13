@@ -64,9 +64,15 @@ impl Icon {
     }
 }
 
-/// An icon at `size` pixels. It takes the text color of the element it is in.
-pub fn icon(which: Icon, size: f32) -> gpui::Svg {
-    gpui::svg().path(which.path()).size(px(size)).flex_none()
+/// An icon at `size` pixels in `color`. An SVG is only painted when it has a color of its own: the
+/// color of the element around it does not reach it.
+pub fn icon(which: Icon, size: f32, color: Hsla) -> gpui::Svg {
+    gpui::svg().path(which.path()).size(px(size)).flex_none().text_color(color)
+}
+
+/// The same, taking `hover` while the element named `group` is hovered.
+pub fn icon_hover(which: Icon, size: f32, color: Hsla, hover: Hsla, group: &'static str) -> gpui::Svg {
+    icon(which, size, color).group_hover(group, move |s| s.text_color(hover))
 }
 
 /// A square button with an icon: `side` pixels wide, the icon `glyph` pixels. `hint` is what the
@@ -83,6 +89,7 @@ pub fn icon_button_sized(
     let (fg, hover_bg, hover_fg) = (theme.muted_foreground, theme.accent, theme.foreground);
     div()
         .id(id)
+        .group("icon-button")
         .flex()
         .flex_none()
         .items_center()
@@ -90,9 +97,8 @@ pub fn icon_button_sized(
         .size(px(side))
         .rounded_md()
         .cursor_pointer()
-        .text_color(fg)
-        .hover(move |s| s.bg(hover_bg).text_color(hover_fg))
-        .child(icon(which, glyph))
+        .hover(move |s| s.bg(hover_bg))
+        .child(icon_hover(which, glyph, fg, hover_fg, "icon-button"))
         .tooltip(tip(hint))
         .on_click(move |_, _, cx| on_click(cx))
 }
@@ -332,6 +338,15 @@ mod tests {
             let bytes = Assets.load(icon.path()).unwrap().unwrap_or_else(|| panic!("{} is missing", icon.path()));
             let text = std::str::from_utf8(&bytes).unwrap();
             assert!(text.starts_with("<svg") && text.contains("viewBox") && text.contains("<path"), "{}", icon.path());
+
+            // And it draws something: render it with the engine GPUI uses.
+            let tree = resvg::usvg::Tree::from_data(&bytes, &resvg::usvg::Options::default())
+                .unwrap_or_else(|e| panic!("{} does not parse: {e}", icon.path()));
+            let mut pixmap = resvg::tiny_skia::Pixmap::new(64, 64).unwrap();
+            let scale = 64.0 / tree.size().width();
+            resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+            let painted = pixmap.pixels().iter().filter(|p| p.alpha() > 0).count();
+            assert!(painted > 40, "{} draws almost nothing ({painted} pixels)", icon.path());
         }
     }
 }

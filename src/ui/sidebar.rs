@@ -6,7 +6,7 @@ use gpui::{
 };
 
 use super::parts::{
-    Icon, PaneDrag, backdrop, color_chip, icon, icon_button, menu_item, menu_panel, menu_separator,
+    Icon, PaneDrag, backdrop, color_chip, icon_button, icon_hover, menu_item, menu_panel, menu_separator,
     menu_title, mini_icon_button, overlay, text_button,
 };
 use super::{MAC, Snapshot, VERSION, shortcut};
@@ -48,8 +48,15 @@ pub fn sidebar(snap: &Snapshot, theme: &Theme, state: &Entity<AppState>) -> AnyE
             .text_size(px(12.))
             .font_weight(FontWeight::MEDIUM)
             .text_color(theme.muted_foreground)
+            .group("parked-toggle")
             .hover(move |s| s.text_color(fg))
-            .child(icon(if parked_open { Icon::CaretDown } else { Icon::CaretRight }, 12.))
+            .child(icon_hover(
+                if parked_open { Icon::CaretDown } else { Icon::CaretRight },
+                12.,
+                theme.muted_foreground,
+                fg,
+                "parked-toggle",
+            ))
             .child(format!("Parked  {}", parked.len()))
             .on_click(move |_, _, cx| toggle.update(cx, |s, cx| s.toggle_parked_list(cx)));
         list = list.child(div().border_t_1().border_color(theme.border).mt_2().child(header));
@@ -208,6 +215,7 @@ fn workspace_item(
     let menu_id = ws.id.clone();
     let dots = div()
         .id(("ws-menu", id.1 + if ws.parked { 1000 } else { 0 }))
+        .group("ws-dots")
         .flex()
         .flex_none()
         .items_center()
@@ -218,7 +226,7 @@ fn workspace_item(
         .opacity(if menu_open { 1.0 } else { 0.0 })
         .group_hover("ws-row", |s| s.opacity(1.0))
         .hover(move |s| s.text_color(fg))
-        .child(icon(Icon::Dots, 16.))
+        .child(icon_hover(Icon::Dots, 16., muted, fg, "ws-dots"))
         .on_click(move |_, _, cx| {
             cx.stop_propagation();
             menu_state.update(cx, |s, cx| s.toggle_menu(Menu::Workspace(menu_id.clone()), cx))
