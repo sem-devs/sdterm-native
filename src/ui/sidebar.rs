@@ -6,10 +6,10 @@ use gpui::{
 };
 
 use super::parts::{
-    PaneDrag, backdrop, color_chip, icon_button, menu_item, menu_panel, menu_separator, overlay,
-    text_button,
+    Icon, PaneDrag, backdrop, color_chip, icon, icon_button, menu_item, menu_panel, menu_separator,
+    menu_title, mini_icon_button, overlay, text_button,
 };
-use super::{MAC, Snapshot, VERSION};
+use super::{MAC, Snapshot, VERSION, shortcut};
 use crate::model::Workspace;
 use crate::state::{AppState, Edit, Menu, View, pane_label};
 use crate::theme::Theme;
@@ -22,10 +22,14 @@ pub fn sidebar(snap: &Snapshot, theme: &Theme, state: &Entity<AppState>) -> AnyE
 
     let mut list =
         div().id("workspace-list").flex().flex_col().gap_0p5().p_2().flex_1().overflow_y_scroll();
+    // Where each row is, roughly, so its menu knows whether to open up or down.
+    let mut y = 76.0_f32;
     for (i, ws) in running.iter().enumerate() {
-        list = list.child(workspace_item(("ws", i), ws, active_id.as_deref(), snap, theme, state));
+        list = list.child(workspace_item(("ws", i), ws, y, active_id.as_deref(), snap, theme, state));
+        y += 34.0;
         if Some(&ws.id) == active_id.as_ref() {
             list = list.child(pane_list(ws, snap, theme, state));
+            y += pane_list_height(ws);
         }
     }
     if !parked.is_empty() {
@@ -45,13 +49,15 @@ pub fn sidebar(snap: &Snapshot, theme: &Theme, state: &Entity<AppState>) -> AnyE
             .font_weight(FontWeight::MEDIUM)
             .text_color(theme.muted_foreground)
             .hover(move |s| s.text_color(fg))
-            .child(if parked_open { "▾" } else { "▸" })
+            .child(icon(if parked_open { Icon::CaretDown } else { Icon::CaretRight }, 12.))
             .child(format!("Parked  {}", parked.len()))
             .on_click(move |_, _, cx| toggle.update(cx, |s, cx| s.toggle_parked_list(cx)));
         list = list.child(div().border_t_1().border_color(theme.border).mt_2().child(header));
+        y += 46.0;
         if parked_open {
             for (i, ws) in parked.iter().enumerate() {
-                list = list.child(workspace_item(("parked", i), ws, active_id.as_deref(), snap, theme, state));
+                list = list.child(workspace_item(("parked", i), ws, y, active_id.as_deref(), snap, theme, state));
+                y += 34.0;
             }
         }
     }
@@ -80,7 +86,7 @@ pub fn sidebar(snap: &Snapshot, theme: &Theme, state: &Entity<AppState>) -> AnyE
                 .pl(px(if MAC { 80. } else { 16. }))
                 .pr_2()
                 .child(div().font_weight(FontWeight::SEMIBOLD).child("sdterm"))
-                .child(icon_button("hide-sidebar", "◧", theme, move |cx| {
+                .child(icon_button("hide-sidebar", Icon::Sidebar, format!("Hide sidebar ({})", shortcut("B")), theme, move |cx| {
                     hide.update(cx, |s, cx| s.toggle_sidebar(cx))
                 })),
         )
@@ -99,7 +105,7 @@ pub fn sidebar(snap: &Snapshot, theme: &Theme, state: &Entity<AppState>) -> AnyE
                         .text_color(theme.muted_foreground)
                         .child("Workspaces"),
                 )
-                .child(icon_button("new-workspace", "+", theme, move |cx| {
+                .child(icon_button("new-workspace", Icon::Plus, format!("New workspace ({})", shortcut("N")), theme, move |cx| {
                     new_ws.update(cx, |s, cx| s.add_workspace(cx))
                 })),
         )
@@ -130,7 +136,7 @@ pub fn sidebar(snap: &Snapshot, theme: &Theme, state: &Entity<AppState>) -> AnyE
                                 .child(format!("v{VERSION}")),
                         ),
                 )
-                .child(icon_button("open-settings", "⚙", theme, move |cx| {
+                .child(icon_button("open-settings", Icon::Gear, format!("Settings ({})", if MAC { "\u{2318}," } else { "Ctrl+Shift+," }), theme, move |cx| {
                     settings.update(cx, |s, cx| {
                         let window = s.window_id.clone();
                         let next = if s.view_of(&window) == View::Settings { View::Terminals } else { View::Settings };
@@ -144,6 +150,7 @@ pub fn sidebar(snap: &Snapshot, theme: &Theme, state: &Entity<AppState>) -> AnyE
 fn workspace_item(
     id: (&'static str, usize),
     ws: &Workspace,
+    row_y: f32,
     active_id: Option<&str>,
     snap: &Snapshot,
     theme: &Theme,
@@ -211,15 +218,29 @@ fn workspace_item(
         .opacity(if menu_open { 1.0 } else { 0.0 })
         .group_hover("ws-row", |s| s.opacity(1.0))
         .hover(move |s| s.text_color(fg))
-        .child("⋯")
+        .child(icon(Icon::Dots, 16.))
         .on_click(move |_, _, cx| {
             cx.stop_propagation();
             menu_state.update(cx, |s, cx| s.toggle_menu(Menu::Workspace(menu_id.clone()), cx))
         });
 
+    // A parked workspace starts again from its row.
+    let launch = ws.parked.then(|| {
+        let (st, wid) = (state.clone(), ws.id.clone());
+        div()
+            .flex_none()
+            .opacity(0.0)
+            .group_hover("ws-row", |s| s.opacity(1.0))
+            .child(mini_icon_button(("ws-launch", id.1), Icon::Play, "Launch terminals", theme, move |cx| {
+                cx.stop_propagation();
+                st.update(cx, |s, cx| s.set_parked(&wid, false, cx))
+            }))
+    });
+
     row = row
         .child(name)
         .child(div().flex_none().text_size(px(12.)).child(ws.panes.len().to_string()))
+        .children(launch)
         .child(dots)
         .on_click(move |ev, _, cx| {
             if ev.click_count() >= 2 {
@@ -230,7 +251,7 @@ fn workspace_item(
         });
 
     if menu_open {
-        row = row.child(overlay(workspace_menu(ws, snap, theme, state)));
+        row = row.child(overlay(workspace_menu(ws, row_y, snap, theme, state)));
     }
     row.into_any_element()
 }
@@ -261,20 +282,30 @@ fn window_label(id: &str) -> String {
     if id == "main" { "1".to_string() } else { id.trim_start_matches('w').to_string() }
 }
 
-fn workspace_menu(ws: &Workspace, snap: &Snapshot, theme: &Theme, state: &Entity<AppState>) -> AnyElement {
+fn workspace_menu(ws: &Workspace, row_y: f32, snap: &Snapshot, theme: &Theme, state: &Entity<AppState>) -> AnyElement {
     let id = ws.id.clone();
-    let mut panel = menu_panel(theme).top(px(30.)).right(px(4.)).w(px(220.));
+    let file_manager = if MAC { "Finder" } else { "Explorer" };
+    let mut other: Vec<String> = snap.open_windows.iter().filter(|w| **w != snap.window_id).cloned().collect();
+    other.sort();
+
+    // Opens below the row, or above it when there is not enough room under it.
+    let height = 300.0 + if ws.folder.is_empty() { 0.0 } else { 56.0 } + 28.0 * other.len() as f32;
+    let upward = row_y + 32.0 + height > snap.window_height - 8.0 && row_y > height;
+    let mut panel = menu_panel(theme).right(px(4.)).w(px(256.));
+    panel = if upward { panel.bottom(px(30.)) } else { panel.top(px(30.)) };
 
     if matches!(&snap.menu, Some(Menu::ConfirmDelete(_))) {
         let (yes, no) = (state.clone(), state.clone());
         let id = id.clone();
+        let count = ws.panes.len();
         return panel
             .gap_2()
             .p_3()
             .child(div().child(format!(
-                "Delete \"{}\"? Its {} terminals will be stopped.",
+                "Delete \"{}\"? Its {} {} will be stopped.",
                 ws.name,
-                ws.panes.len()
+                count,
+                if count == 1 { "terminal" } else { "terminals" }
             )))
             .child(
                 div()
@@ -299,12 +330,54 @@ fn workspace_menu(ws: &Workspace, snap: &Snapshot, theme: &Theme, state: &Entity
         s1.update(cx, |s, cx| s.begin_edit(Edit::WorkspaceName(rename_id.clone()), cx))
     }));
 
+    // The folder new terminals of this workspace start in.
+    panel = panel.child(menu_title(theme, "Project folder")).child(
+        div()
+            .px_2()
+            .pb_1()
+            .text_size(px(11.))
+            .text_color(theme.muted_foreground)
+            .when(!ws.folder.is_empty(), |d| d.truncate())
+            .child(if ws.folder.is_empty() {
+                "Not set. New terminals start in your home folder.".to_string()
+            } else {
+                ws.folder.clone()
+            }),
+    );
+    let s3 = state.clone();
+    let folder_id = id.clone();
+    panel = panel.child(menu_item(
+        "m-folder",
+        if ws.folder.is_empty() { "Choose folder\u{2026}" } else { "Change folder\u{2026}" },
+        theme,
+        false,
+        move |cx| {
+            s3.update(cx, |s, cx| s.close_menu(cx));
+            choose_folder(cx, s3.clone(), folder_id.clone());
+        },
+    ));
+    if !ws.folder.is_empty() {
+        let folder = ws.folder.clone();
+        let s4 = state.clone();
+        panel = panel.child(menu_item("m-reveal", format!("Show in {file_manager}"), theme, false, move |cx| {
+            cx.reveal_path(std::path::Path::new(&folder));
+            s4.update(cx, |s, cx| s.close_menu(cx));
+        }));
+        let (s6, clear_id) = (state.clone(), id.clone());
+        panel = panel.child(menu_item("m-clear-folder", "Clear folder", theme, false, move |cx| {
+            s6.update(cx, |s, cx| {
+                s.close_menu(cx);
+                s.set_workspace_folder(&clear_id, "", cx)
+            })
+        }));
+    }
+
     let s2 = state.clone();
     let park_id = id.clone();
     let parked = ws.parked;
-    panel = panel.child(menu_item(
+    panel = panel.child(menu_title(theme, "Workspace")).child(menu_item(
         "m-park",
-        if parked { "Launch terminals" } else { "Park (stop the terminals)" },
+        if parked { "Launch terminals" } else { "Park (stop its terminals)" },
         theme,
         false,
         move |cx| {
@@ -315,35 +388,17 @@ fn workspace_menu(ws: &Workspace, snap: &Snapshot, theme: &Theme, state: &Entity
         },
     ));
 
-    let s3 = state.clone();
-    let folder_id = id.clone();
-    panel = panel.child(menu_item("m-folder", "Set project folder…", theme, false, move |cx| {
-        s3.update(cx, |s, cx| s.close_menu(cx));
-        choose_folder(cx, s3.clone(), folder_id.clone());
-    }));
-
-    if !ws.folder.is_empty() {
-        let folder = ws.folder.clone();
-        let s4 = state.clone();
-        panel = panel.child(menu_item("m-reveal", "Show project folder", theme, false, move |cx| {
-            cx.reveal_path(std::path::Path::new(&folder));
-            s4.update(cx, |s, cx| s.close_menu(cx));
-        }));
-    }
-
     // Move the workspace, with its running terminals, to another window.
-    let mut other: Vec<String> = snap.open_windows.iter().filter(|w| **w != snap.window_id).cloned().collect();
-    other.sort();
-    panel = panel.child(menu_separator(theme));
+    panel = panel.child(menu_title(theme, "Move to"));
     for (i, window) in other.iter().enumerate() {
         let (st, wid, win) = (state.clone(), id.clone(), window.clone());
-        panel = panel.child(menu_item(("m-move", i), format!("Move to window {}", window_label(window)), theme, false, move |cx| {
+        panel = panel.child(menu_item(("m-move", i), format!("Window {}", window_label(window)), theme, false, move |cx| {
             st.update(cx, |s, cx| s.move_workspace(&wid, &win, cx))
         }));
     }
     let st = state.clone();
     let wid = id.clone();
-    panel = panel.child(menu_item("m-move-new", "Move to a new window", theme, false, move |cx| {
+    panel = panel.child(menu_item("m-move-new", "New window", theme, false, move |cx| {
         let window = st.update(cx, |s, cx| {
             let window = s.new_window_id();
             s.register_window(&window);
@@ -357,7 +412,7 @@ fn workspace_menu(ws: &Workspace, snap: &Snapshot, theme: &Theme, state: &Entity
     let del_id = id;
     panel
         .child(menu_separator(theme))
-        .child(menu_item("m-delete", "Delete…", theme, true, move |cx| {
+        .child(menu_item("m-delete", "Delete\u{2026}", theme, true, move |cx| {
             s5.update(cx, |s, cx| s.open_menu(Menu::ConfirmDelete(del_id.clone()), cx))
         }))
         .into_any_element()
@@ -380,6 +435,14 @@ fn choose_folder(cx: &mut App, state: Entity<AppState>, workspace: String) {
         }
     })
     .detach();
+}
+
+/// About how tall the list of terminals under the active workspace is.
+fn pane_list_height(ws: &Workspace) -> f32 {
+    if ws.parked || ws.panes.is_empty() {
+        return 0.0;
+    }
+    8.0 + ws.panes.iter().map(|p| if p.note.trim().is_empty() { 25.0 } else { 41.0 }).sum::<f32>()
 }
 
 /// Which terminal is which and what it was for: name, color and note at a glance.
@@ -441,7 +504,9 @@ fn pane_list(ws: &Workspace, snap: &Snapshot, theme: &Theme, state: &Entity<AppS
 
 /// The click-away layer for whichever menu is open.
 pub fn menu_backdrop(snap: &Snapshot, state: &Entity<AppState>) -> Option<AnyElement> {
-    snap.menu.as_ref()?;
+    if snap.menu.is_none() && snap.pane_editor.is_none() {
+        return None;
+    }
     let state = state.clone();
-    Some(backdrop(move |cx| state.update(cx, |s, cx| s.close_menu(cx))))
+    Some(backdrop(move |cx| state.update(cx, |s, cx| s.dismiss_overlays(cx))))
 }

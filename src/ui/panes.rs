@@ -8,13 +8,14 @@ use gpui::{
 use gpui_terminal::TerminalView;
 
 use super::parts::{
-    DividerDrag, DragGhost, NoGhost, PaneDrag, color_chip, icon_button, menu_item, menu_panel,
-    menu_title, mix, overlay, text_button,
+    DividerDrag, DragGhost, Icon, NoGhost, PaneDrag, color_chip, icon, icon_button, menu_panel,
+    mini_icon_button, mix, overlay, text_button, tip,
 };
-use super::{MAC, Snapshot};
+use super::{MAC, Snapshot, shortcut};
 use crate::layout::{self, Axis, Node};
 use crate::model::{LAYOUTS, LayoutId, PANE_COLORS, Pane, PaneColor, Workspace};
 use crate::state::{AppState, Edit, Menu, View, pane_label};
+use crate::text_input::TextInput;
 use crate::updater::UpdateStatus;
 use crate::theme::Theme;
 
@@ -48,7 +49,7 @@ pub fn main_area(snap: Snapshot, theme: &Theme, state: &Entity<AppState>) -> Any
                 .gap_2()
                 .min_w(px(0.))
                 .when(snap.sidebar_collapsed, |d| {
-                    d.child(icon_button("show-sidebar", "◧", theme, move |cx| {
+                    d.child(icon_button("show-sidebar", Icon::Sidebar, format!("Show sidebar ({})", shortcut("B")), theme, move |cx| {
                         show_sidebar.update(cx, |s, cx| s.toggle_sidebar(cx))
                     }))
                 })
@@ -65,7 +66,7 @@ pub fn main_area(snap: Snapshot, theme: &Theme, state: &Entity<AppState>) -> Any
                     .items_center()
                     .gap_1()
                     .child(layout_button(&active, &snap, theme, state))
-                    .child(icon_button("new-terminal", "+", theme, move |cx| {
+                    .child(icon_button("new-terminal", Icon::Plus, format!("New terminal ({})", shortcut("T")), theme, move |cx| {
                         new_pane.update(cx, |s, cx| s.add_pane(cx))
                     })),
             )
@@ -85,7 +86,7 @@ pub fn main_area(snap: Snapshot, theme: &Theme, state: &Entity<AppState>) -> Any
                     move |cx| s.update(cx, |s, cx| s.add_workspace(cx))
                 },
             ),
-            Some(ws) if ws.parked => parked_view(ws, theme, state),
+            Some(ws) if ws.parked => parked_view(ws, &snap, theme, state),
             Some(ws) if ws.panes.is_empty() => empty_state(
                 theme,
                 "No terminals in this workspace",
@@ -207,6 +208,7 @@ fn layout_button(active: &Workspace, snap: &Snapshot, theme: &Theme, state: &Ent
         .id("layout-button")
         .flex()
         .items_center()
+        .gap_1p5()
         .h(px(28.))
         .px_2()
         .rounded_md()
@@ -214,7 +216,9 @@ fn layout_button(active: &Workspace, snap: &Snapshot, theme: &Theme, state: &Ent
         .text_size(px(12.))
         .text_color(theme.muted_foreground)
         .hover(move |s| s.bg(bg).text_color(fg))
-        .child(format!("Layout: {}", active.layout.label()))
+        .tooltip(tip("Arrange terminals"))
+        .child(icon(Icon::SquaresFour, 16.))
+        .child(active.layout.label())
         .on_click(move |_, _, cx| toggle.update(cx, |s, cx| s.toggle_menu(Menu::Layout, cx)));
 
     let mut holder = div().relative().child(button);
@@ -287,6 +291,7 @@ fn empty_state(
         .items_start()
         .gap_4()
         .px(px(64.))
+        .child(div().text_color(theme.muted_foreground).child(icon(Icon::TerminalWindow, 32.)))
         .child(
             div()
                 .flex()
@@ -299,51 +304,169 @@ fn empty_state(
         .into_any_element()
 }
 
-fn parked_view(ws: &Workspace, theme: &Theme, state: &Entity<AppState>) -> AnyElement {
+fn parked_view(ws: &Workspace, snap: &Snapshot, theme: &Theme, state: &Entity<AppState>) -> AnyElement {
     let id = ws.id.clone();
-    let state = state.clone();
-    let mut list = div().flex().flex_col().gap_2().mt_2();
+    let launch_state = state.clone();
+    let count = ws.panes.len();
+    let folder_name = if MAC { "Finder" } else { "Explorer" };
+    let mut list = div().flex().flex_col().mt_2().max_w(px(640.)).border_t_1().border_color(theme.border);
     for (i, pane) in ws.panes.iter().enumerate() {
+        let folder = snap.pane_folders.get(&pane.id).cloned().or_else(|| {
+            (!ws.folder.is_empty()).then(|| ws.folder.clone())
+        });
+        let reveal = folder.clone().map(|folder| {
+            mini_icon_button(("parked-folder", i), Icon::FolderOpen, format!("Show folder in {folder_name}"), theme, move |cx| {
+                cx.reveal_path(std::path::Path::new(&folder))
+            })
+        });
         list = list.child(
             div()
                 .flex()
                 .items_start()
                 .gap_3()
+                .py_3()
+                .border_b_1()
+                .border_color(theme.border)
                 .child(div().mt(px(4.)).child(color_chip(theme, pane.color)))
                 .child(
                     div()
                         .flex()
                         .flex_col()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .gap_0p5()
                         .child(div().font_weight(FontWeight::MEDIUM).child(pane_label(pane, i)))
                         .when(!pane.note.trim().is_empty(), |d| {
-                            d.child(div().text_color(theme.muted_foreground).child(pane.note.clone()))
+                            d.child(div().text_size(px(12.)).text_color(theme.muted_foreground).child(pane.note.clone()))
+                        })
+                        .when_some(folder, |d, folder| {
+                            d.child(div().truncate().text_size(px(11.)).text_color(theme.muted_foreground).child(folder))
                         }),
-                ),
+                )
+                .children(reveal),
         );
     }
+    let (primary, primary_fg) = (theme.primary, theme.primary_foreground);
+    let launch = div()
+        .id("launch")
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap_2()
+        .h(px(30.))
+        .px_3()
+        .rounded_md()
+        .cursor_pointer()
+        .bg(primary)
+        .text_color(primary_fg)
+        .hover(move |s| s.bg(primary.opacity(0.85)))
+        .child(icon(Icon::Play, 14.))
+        .child(format!("Launch {count} {}", if count == 1 { "terminal" } else { "terminals" }))
+        .on_click(move |_, _, cx| {
+            if count > 0 {
+                launch_state.update(cx, |s, cx| s.set_parked(&id, false, cx))
+            }
+        });
     div()
+        .id("parked-view")
         .size_full()
+        .overflow_y_scroll()
         .flex()
         .flex_col()
-        .justify_center()
         .items_start()
-        .gap_3()
-        .px(px(64.))
-        .child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child(ws.name.clone()))
+        .gap_4()
+        .px(px(48.))
+        .py(px(40.))
+        .child(div().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).child(ws.name.clone()))
         .child(
             div()
                 .max_w(px(480.))
                 .text_color(theme.muted_foreground)
-                .child("Parked: its terminals are stopped, but their names, notes and folders are kept."),
+                .child("Parked. Its terminals are stopped, so it costs nothing. Names, notes, colors and folders are kept, and every terminal starts again where it left off."),
         )
+        .child(launch)
         .child(list)
-        .child(text_button("launch", "Launch terminals", theme, true, move |cx| {
-            state.update(cx, |s, cx| s.set_parked(&id, false, cx))
-        }))
         .into_any_element()
 }
 
 // ---- Terminals -----------------------------------------------------------------------------
+
+/// A labeled part of the details editor.
+fn field(theme: &Theme, label: &'static str, content: impl IntoElement) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1p5()
+        .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(theme.foreground).child(label))
+        .child(content)
+}
+
+/// What opens from the title of a terminal: its name, a note about it and its color, in one place.
+fn details_editor(
+    pane: &Pane,
+    name: Entity<TextInput>,
+    note: Entity<TextInput>,
+    theme: &Theme,
+    state: &Entity<AppState>,
+) -> AnyElement {
+    let mut swatches = div().flex().flex_wrap().gap_1p5();
+    {
+        let (state, id) = (state.clone(), pane.id.clone());
+        let none = pane.color.is_none();
+        let (fg, muted, border, hover) = (theme.foreground, theme.muted_foreground, theme.input, theme.accent);
+        swatches = swatches.child(
+            div()
+                .id("no-color")
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(24.))
+                .rounded_md()
+                .border_1()
+                .border_color(if none { fg } else { border })
+                .text_color(if none { fg } else { muted })
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover))
+                .tooltip(tip("No color"))
+                .child(icon(Icon::Prohibit, 14.))
+                .on_click(move |_, _, cx| state.update(cx, |s, cx| s.set_pane_color(&id, None, cx))),
+        );
+    }
+    for (i, color) in PANE_COLORS.iter().enumerate() {
+        let color: PaneColor = *color;
+        let (state, id) = (state.clone(), pane.id.clone());
+        swatches = swatches.child(
+            div()
+                .id(("swatch", i))
+                .size(px(24.))
+                .rounded_md()
+                .cursor_pointer()
+                .bg(theme.pane(Some(color)))
+                .border_2()
+                .border_color(if pane.color == Some(color) { theme.foreground } else { transparent_black() })
+                .tooltip(tip(color.label()))
+                .on_click(move |_, _, cx| state.update(cx, |s, cx| s.set_pane_color(&id, Some(color), cx))),
+        );
+    }
+    overlay(
+        menu_panel(theme)
+            .top(px(34.))
+            .left(px(8.))
+            .w(px(320.))
+            .p_3()
+            .gap_3()
+            .child(field(theme, "Name", name))
+            .child(field(theme, "Note", note))
+            .child(field(theme, "Color", swatches))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.muted_foreground)
+                    .child("Saved as you type. Esc or a click outside closes this."),
+            ),
+    )
+    .into_any_element()
+}
 
 fn pane_frame(
     index: usize,
@@ -359,119 +482,75 @@ fn pane_frame(
     let header_bg = if focused { mix(theme.muted, accent, 0.14) } else { theme.muted };
     let label = pane_label(pane, index);
 
-    let editing = |kind: fn(String) -> Edit| {
-        snap.editor.as_ref().filter(|(e, _)| *e == kind(pane.id.clone())).map(|(_, i)| i.clone())
-    };
-    let name_input = editing(Edit::PaneName);
-    let note_input = editing(Edit::PaneNote);
-    let color_open = snap.menu == Some(Menu::PaneColor(pane.id.clone()));
+    let fields = snap.pane_editor.as_ref().filter(|f| f.id == pane.id);
+    let folder_name = if MAC { "Finder" } else { "Explorer" };
 
     let (focus_state, close_state) = (state.clone(), state.clone());
     let (focus_id, close_id) = (pane.id.clone(), pane.id.clone());
 
-    // Name: double-click to rename.
-    let name_state = state.clone();
-    let name_id = pane.id.clone();
-    let name: AnyElement = match name_input {
-        Some(input) => div().w(px(170.)).flex_none().child(input).into_any_element(),
-        None => div()
-            .id(("pane-name", index))
-            .flex_none()
-            .font_weight(if focused { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
-            .child(label.clone())
-            .on_click(move |ev, _, cx| {
-                if ev.click_count() >= 2 {
-                    name_state.update(cx, |s, cx| s.begin_edit(Edit::PaneName(name_id.clone()), cx));
-                }
-            })
-            .into_any_element(),
-    };
-
-    // Note: click to write what this terminal is for.
+    // The title: click it to change the name, the note and the color.
     let first_line = pane.note.lines().next().unwrap_or("").to_string();
-    let note_state = state.clone();
-    let note_id = pane.id.clone();
-    let note = div()
-        .id(("pane-note", index))
-        .min_w(px(0.))
-        .truncate()
-        .cursor_pointer()
-        .text_color(if first_line.is_empty() { muted.opacity(0.55) } else { muted })
-        .child(if first_line.is_empty() { "Add a note".to_string() } else { first_line })
-        .on_click(move |_, _, cx| {
-            note_state.update(cx, |s, cx| s.begin_edit(Edit::PaneNote(note_id.clone()), cx))
-        });
-
-    // Color chip: click to choose another color.
-    let chip_state = state.clone();
-    let chip_id = pane.id.clone();
-    let chip = div()
-        .id(("pane-color", index))
+    let open_state = state.clone();
+    let open_id = pane.id.clone();
+    let hover_bg = theme.accent.opacity(0.5);
+    let title = div()
+        .id(("pane-title", index))
         .flex()
-        .flex_none()
+        .flex_1()
         .items_center()
-        .justify_center()
-        .size(px(18.))
+        .gap_2()
+        .h_full()
+        .min_w(px(0.))
+        .px_1()
         .rounded_sm()
         .cursor_pointer()
-        .hover({
-            let bg = theme.accent;
-            move |s| s.bg(bg)
-        })
+        .hover(move |s| s.bg(hover_bg))
+        .tooltip(tip(if pane.note.trim().is_empty() {
+            "Edit name, note and color".to_string()
+        } else {
+            pane.note.clone()
+        }))
         .child(color_chip(theme, pane.color))
+        .child(
+            div()
+                .flex_none()
+                .font_weight(if focused { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
+                .child(label.clone()),
+        )
+        .child(
+            div()
+                .min_w(px(0.))
+                .truncate()
+                .text_color(if first_line.is_empty() { muted.opacity(0.55) } else { muted })
+                .child(if first_line.is_empty() { "Add a note".to_string() } else { first_line }),
+        )
         .on_click(move |_, _, cx| {
-            chip_state.update(cx, |s, cx| s.toggle_menu(Menu::PaneColor(chip_id.clone()), cx))
+            open_state.update(cx, |s, cx| s.begin_edit(Edit::PaneDetails(open_id.clone()), cx))
         });
-    let mut chip_holder = div().relative().flex_none().child(chip);
-    if color_open {
-        let mut swatches = div().flex().flex_wrap().gap_1().w(px(148.));
-        for (i, color) in PANE_COLORS.iter().enumerate() {
-            let color: PaneColor = *color;
-            let (state, id) = (state.clone(), pane.id.clone());
-            swatches = swatches.child(
-                div()
-                    .id(("swatch", i))
-                    .size(px(22.))
-                    .rounded_md()
-                    .cursor_pointer()
-                    .bg(theme.pane(Some(color)))
-                    .border_2()
-                    .border_color(if pane.color == Some(color) { theme.foreground } else { transparent_black() })
-                    .on_click(move |_, _, cx| {
-                        state.update(cx, |s, cx| {
-                            s.close_menu(cx);
-                            s.set_pane_color(&id, Some(color), cx)
-                        })
-                    }),
-            );
-        }
-        let (state, id) = (state.clone(), pane.id.clone());
-        chip_holder = chip_holder.child(overlay(
-            menu_panel(theme)
-                .top(px(22.))
-                .left_0()
-                .p_2()
-                .gap_2()
-                .child(menu_title(theme, "Color"))
-                .child(swatches)
-                .child(menu_item("no-color", "No color", theme, false, move |cx| {
-                    state.update(cx, |s, cx| {
-                        s.close_menu(cx);
-                        s.set_pane_color(&id, None, cx)
-                    })
-                })),
-        ));
-    }
 
     // Open the terminal's folder in Finder or Explorer.
     let reveal_state = state.clone();
     let reveal_id = pane.id.clone();
-    let reveal = icon_button(("pane-folder", index), "⌂", theme, move |cx| {
-        let folder = reveal_state.read(cx).pane_folder(&reveal_id);
-        if let Some(folder) = folder {
-            cx.reveal_path(&folder);
-        }
-    });
+    let reveal = mini_icon_button(
+        ("pane-folder", index),
+        Icon::FolderOpen,
+        format!("Show folder in {folder_name}"),
+        theme,
+        move |cx| {
+            let folder = reveal_state.read(cx).pane_folder(&reveal_id);
+            if let Some(folder) = folder {
+                cx.reveal_path(&folder);
+            }
+        },
+    );
+
+    let close = mini_icon_button(
+        ("close-pane", index),
+        Icon::X,
+        format!("Close terminal ({})", shortcut("W")),
+        theme,
+        move |cx| close_state.update(cx, |s, cx| s.close_pane(&close_id, cx)),
+    );
 
     let drag = PaneDrag { id: pane.id.clone(), label: label.clone(), color: accent };
     let (drop_state, drop_id) = (state.clone(), pane.id.clone());
@@ -479,13 +558,12 @@ fn pane_frame(
 
     let header = div()
         .id(("pane-header", index))
-        .h(px(26.))
+        .h(px(28.))
         .flex_none()
         .flex()
         .items_center()
-        .justify_between()
-        .gap_2()
-        .pl_2()
+        .gap_1()
+        .pl_1()
         .pr_1()
         .bg(header_bg)
         .text_size(px(12.))
@@ -494,38 +572,8 @@ fn pane_frame(
         .on_drag(drag, |drag, _, _, cx| {
             cx.new(|_| DragGhost { label: drag.label.clone(), color: drag.color })
         })
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .min_w(px(0.))
-                .child(chip_holder)
-                .child(name)
-                .child(note),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .child(reveal.size(px(22.)))
-                .child(
-                    div()
-                        .id(("close-pane", index))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .size(px(22.))
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .hover(move |s| s.text_color(fg))
-                        .child("×")
-                        .on_click(move |_, _, cx| {
-                            close_state.update(cx, |s, cx| s.close_pane(&close_id, cx))
-                        }),
-                ),
-        );
+        .child(title)
+        .child(div().flex().flex_none().items_center().child(reveal).child(close));
 
     let mut frame = div()
         .id(("pane", index))
@@ -550,27 +598,8 @@ fn pane_frame(
         .child(header)
         .child(div().flex_1().min_h(px(0.)).overflow_hidden().child(view));
 
-    if let Some(input) = note_input {
-        frame = frame.child(overlay(
-            menu_panel(theme)
-                .top(px(34.))
-                .left(px(8.))
-                .right(px(8.))
-                .p_2()
-                .gap_2()
-                .child(menu_title(theme, "What is this terminal for?"))
-                .child(input)
-                .child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(theme.muted_foreground)
-                        .child(if cfg!(target_os = "macos") {
-                            "Enter for a new line, ⌘Enter to save, Esc to cancel"
-                        } else {
-                            "Enter for a new line, Ctrl+Enter to save, Esc to cancel"
-                        }),
-                ),
-        ));
+    if let Some(fields) = fields {
+        frame = frame.child(details_editor(pane, fields.name.clone(), fields.note.clone(), theme, state));
     }
     frame.into_any_element()
 }
@@ -597,7 +626,7 @@ fn open_slot(theme: &Theme, state: &Entity<AppState>, n: usize) -> AnyElement {
                 .cursor_pointer()
                 .text_color(muted)
                 .hover(move |s| s.text_color(fg))
-                .child(div().text_size(px(20.)).child("+"))
+                .child(icon(Icon::Plus, 20.))
                 .child("New terminal")
                 .on_click(move |_, _, cx| state.update(cx, |s, cx| s.add_pane(cx))),
         )

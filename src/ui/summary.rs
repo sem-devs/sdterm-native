@@ -5,6 +5,7 @@ use gpui::{AnyElement, Entity, FontWeight, div, px};
 
 use super::Snapshot;
 use super::charts::chart;
+use super::parts::{Icon, icon, tip};
 use crate::metrics::{Metric, WidgetKind};
 use crate::monitors;
 use crate::resources::Sample;
@@ -58,7 +59,8 @@ fn row(
                 .opacity(0.0)
                 .group_hover("res-row", |s| s.opacity(1.0))
                 .hover(move |s| s.text_color(fg))
-                .child("↗")
+                .tooltip(tip("Open in its own window"))
+                .child(icon(Icon::ArrowSquareOut, 14.))
                 .on_click(move |_, _, cx| monitors::open(cx, kind, &state)),
         )
         .into_any_element()
@@ -127,7 +129,8 @@ pub fn resources_summary(theme: &Theme, snap: &Snapshot, state: &Entity<AppState
                                 .cursor_pointer()
                                 .text_color(muted)
                                 .hover(move |s| s.text_color(fg))
-                                .child("↗")
+                                .tooltip(tip("Open all in one window"))
+                                .child(icon(Icon::ArrowSquareOut, 14.))
                                 .on_click(move |_, _, cx| {
                                     monitors::open(cx, WidgetKind::Summary, &summary_state)
                                 }),

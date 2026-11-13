@@ -96,6 +96,10 @@ pub enum InputEvent {
     /// Enter (or Cmd+Enter in a note).
     Submit(String),
     Cancel,
+    /// The text changed, with the text as it is now.
+    Changed(String),
+    /// Tab: the field asks for the next one.
+    Tab,
     /// The field lost the focus: what is written counts, like leaving a rename box.
     Blur(String),
 }
@@ -108,6 +112,8 @@ pub struct TextInput {
     marked: Option<Range<usize>>,
     placeholder: SharedString,
     multiline: bool,
+    /// Lines of height the field keeps even when it holds less text.
+    rows: usize,
     _blur: Subscription,
 }
 
@@ -141,8 +147,15 @@ impl TextInput {
             marked: None,
             placeholder: placeholder.to_string().into(),
             multiline,
+            rows: 1,
             _blur: blur,
         }
+    }
+
+    /// A field that is `rows` lines tall from the start, like a note box.
+    pub fn with_rows(mut self, rows: usize) -> Self {
+        self.rows = rows.max(1);
+        self
     }
 
     pub fn focus(&self, window: &mut Window) {
@@ -169,6 +182,7 @@ impl TextInput {
         self.cursor = range.start + new.len();
         self.anchor = None;
         self.marked = None;
+        cx.emit(InputEvent::Changed(self.text.clone()));
         cx.notify();
     }
 
@@ -230,6 +244,7 @@ impl TextInput {
                 }
             }
             "escape" => cx.emit(InputEvent::Cancel),
+            "tab" if !command => cx.emit(InputEvent::Tab),
             "backspace" => self.delete(false, word, mac && m.platform, cx),
             "delete" => self.delete(true, word, mac && m.platform, cx),
             "left" => {
@@ -331,6 +346,7 @@ impl Render for TextInput {
             .w_full()
             .px_2()
             .py_1()
+            .min_h(px(18. * self.rows as f32 + 10.))
             .rounded_md()
             .border_1()
             .border_color(if focused { theme.primary } else { theme.input })
@@ -435,6 +451,7 @@ impl EntityInputHandler for TextInput {
             .map(|r| range.start + offset_from_utf16(new_text, r.end))
             .unwrap_or(range.start + new_text.len());
         self.anchor = None;
+        cx.emit(InputEvent::Changed(self.text.clone()));
         cx.notify();
     }
 

@@ -4,10 +4,10 @@ use gpui::prelude::*;
 use gpui::{AnyElement, App, Entity, FontWeight, PathPromptOptions, div, px};
 
 use super::controls::{choice, row, section, stepper, toggle};
-use super::parts::text_button;
+use super::parts::{Icon, icon, text_button};
 use super::{MAC, Snapshot, VERSION};
 use crate::model::{CursorStyle, FontChoice, NetworkUnit, Settings, ThemeMode};
-use crate::state::{AppState, SETTINGS_SECTIONS, SettingsSection};
+use crate::state::{AppState, SETTINGS_SECTIONS, SettingsSection, View};
 use crate::theme::Theme;
 
 const WEBSITE: &str = "https://sem-devs.com";
@@ -39,7 +39,25 @@ where
 }
 
 pub fn settings_view(snap: &Snapshot, theme: &Theme, state: &Entity<AppState>) -> AnyElement {
-    let mut nav = div().flex().flex_col().gap_0p5().w(px(180.)).flex_none().p_3();
+    let back_state = state.clone();
+    let back_hover = theme.accent;
+    let mut nav = div().flex().flex_col().gap_0p5().w(px(180.)).flex_none().p_3().child(
+        div()
+            .id("settings-back")
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(28.))
+            .px_2()
+            .mb_2()
+            .rounded_md()
+            .cursor_pointer()
+            .text_color(theme.foreground)
+            .hover(move |s| s.bg(back_hover))
+            .child(icon(Icon::ArrowLeft, 16.))
+            .child("Terminals")
+            .on_click(move |_, _, cx| back_state.update(cx, |s, cx| s.set_view(View::Terminals, cx))),
+    );
     for (i, (section, label)) in SETTINGS_SECTIONS.iter().enumerate() {
         let selected = snap.settings_section == *section;
         let (state, section) = (state.clone(), *section);

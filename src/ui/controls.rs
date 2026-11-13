@@ -5,6 +5,7 @@ use std::rc::Rc;
 use gpui::prelude::*;
 use gpui::{AnyElement, App, ElementId, FontWeight, IntoElement, SharedString, div, px};
 
+use super::parts::{Icon, icon};
 use crate::theme::Theme;
 
 pub fn section(
@@ -142,7 +143,7 @@ pub fn stepper(
     on_decrease: impl Fn(&mut App) + 'static,
     on_increase: impl Fn(&mut App) + 'static,
 ) -> impl IntoElement {
-    let step = |id: (&'static str, usize), glyph: &'static str, f: Box<dyn Fn(&mut App)>| {
+    let step = |id: (&'static str, usize), glyph: Icon, f: Box<dyn Fn(&mut App)>| {
         let hover = theme.accent;
         div()
             .id(id)
@@ -154,14 +155,14 @@ pub fn stepper(
             .cursor_pointer()
             .bg(theme.muted)
             .hover(move |s| s.bg(hover))
-            .child(glyph)
+            .child(icon(glyph, 14.))
             .on_click(move |_, _, cx| f(cx))
     };
     div()
         .flex()
         .items_center()
         .gap_2()
-        .child(step((prefix, 0), "−", Box::new(on_decrease)))
+        .child(step((prefix, 0), Icon::Minus, Box::new(on_decrease)))
         .child(div().w(px(48.)).flex().justify_center().child(value.into()))
-        .child(step((prefix, 1), "+", Box::new(on_increase)))
+        .child(step((prefix, 1), Icon::Plus, Box::new(on_increase)))
 }

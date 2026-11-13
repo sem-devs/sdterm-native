@@ -51,8 +51,8 @@ pub enum View {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Edit {
     WorkspaceName(String),
-    PaneName(String),
-    PaneNote(String),
+    /// The name, note and color of a terminal, edited together.
+    PaneDetails(String),
 }
 
 /// A small menu that is open.
@@ -61,7 +61,6 @@ pub enum Menu {
     Layout,
     Workspace(String),
     ConfirmDelete(String),
-    PaneColor(String),
 }
 
 pub struct AppState {
@@ -516,6 +515,15 @@ impl AppState {
     pub fn close_menu(&mut self, cx: &mut Context<Self>) {
         if self.menu.take().is_some() {
             cx.notify();
+        }
+    }
+
+    /// Clicking away from whatever floats over the window: the open menu goes, and a terminal's
+    /// details editor closes with what was typed kept.
+    pub fn dismiss_overlays(&mut self, cx: &mut Context<Self>) {
+        self.close_menu(cx);
+        if matches!(self.editing, Some(Edit::PaneDetails(_))) {
+            self.end_edit(true, cx);
         }
     }
 

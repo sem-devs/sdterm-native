@@ -2,8 +2,8 @@
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Context, Deferred, ElementId, FontWeight, Hsla, Render, Rgba, SharedString,
-    Window, deferred, div, px,
+    AnyElement, AnyView, App, AppContext, Context, Deferred, ElementId, FontWeight, Hsla, Render, Rgba,
+    SharedString, Window, deferred, div, px,
 };
 
 use crate::layout::Divider;
@@ -22,9 +22,61 @@ pub fn mix(a: Hsla, b: Hsla, t: f32) -> Hsla {
     .into()
 }
 
-pub fn icon_button(
+/// The icons of the interface: one family, one weight, like the rest of the app.
+#[derive(Clone, Copy)]
+pub enum Icon {
+    Sidebar,
+    Plus,
+    Minus,
+    Gear,
+    Dots,
+    FolderOpen,
+    X,
+    Play,
+    CaretDown,
+    CaretRight,
+    Prohibit,
+    ArrowSquareOut,
+    TerminalWindow,
+    SquaresFour,
+    ArrowLeft,
+}
+
+impl Icon {
+    fn path(self) -> &'static str {
+        match self {
+            Icon::Sidebar => "icons/sidebar.svg",
+            Icon::Plus => "icons/plus.svg",
+            Icon::Minus => "icons/minus.svg",
+            Icon::Gear => "icons/gear.svg",
+            Icon::Dots => "icons/dots.svg",
+            Icon::FolderOpen => "icons/folder-open.svg",
+            Icon::X => "icons/x.svg",
+            Icon::Play => "icons/play.svg",
+            Icon::CaretDown => "icons/caret-down.svg",
+            Icon::CaretRight => "icons/caret-right.svg",
+            Icon::Prohibit => "icons/prohibit.svg",
+            Icon::ArrowSquareOut => "icons/arrow-square-out.svg",
+            Icon::TerminalWindow => "icons/terminal-window.svg",
+            Icon::SquaresFour => "icons/squares-four.svg",
+            Icon::ArrowLeft => "icons/arrow-left.svg",
+        }
+    }
+}
+
+/// An icon at `size` pixels. It takes the text color of the element it is in.
+pub fn icon(which: Icon, size: f32) -> gpui::Svg {
+    gpui::svg().path(which.path()).size(px(size)).flex_none()
+}
+
+/// A square button with an icon: `side` pixels wide, the icon `glyph` pixels. `hint` is what the
+/// tooltip says.
+pub fn icon_button_sized(
     id: impl Into<ElementId>,
-    glyph: &'static str,
+    which: Icon,
+    side: f32,
+    glyph: f32,
+    hint: impl Into<SharedString>,
     theme: &Theme,
     on_click: impl Fn(&mut App) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
@@ -35,13 +87,61 @@ pub fn icon_button(
         .flex_none()
         .items_center()
         .justify_center()
-        .size(px(28.))
+        .size(px(side))
         .rounded_md()
         .cursor_pointer()
         .text_color(fg)
         .hover(move |s| s.bg(hover_bg).text_color(hover_fg))
-        .child(glyph)
+        .child(icon(which, glyph))
+        .tooltip(tip(hint))
         .on_click(move |_, _, cx| on_click(cx))
+}
+
+pub fn icon_button(
+    id: impl Into<ElementId>,
+    which: Icon,
+    hint: impl Into<SharedString>,
+    theme: &Theme,
+    on_click: impl Fn(&mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    icon_button_sized(id, which, 28., 16., hint, theme, on_click)
+}
+
+/// The small one, for rows and title bars of terminals.
+pub fn mini_icon_button(
+    id: impl Into<ElementId>,
+    which: Icon,
+    hint: impl Into<SharedString>,
+    theme: &Theme,
+    on_click: impl Fn(&mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    icon_button_sized(id, which, 22., 14., hint, theme, on_click)
+}
+
+/// The little label that appears when the pointer rests on a button.
+pub struct Tip(SharedString);
+
+impl Render for Tip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.global::<Theme>().clone();
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.input)
+            .bg(mix(theme.background, theme.foreground, 0.07))
+            .shadow_md()
+            .text_size(px(12.))
+            .text_color(theme.foreground)
+            .child(self.0.clone())
+    }
+}
+
+/// A tooltip builder for `.tooltip(...)`.
+pub fn tip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+    let text: SharedString = text.into();
+    move |_, cx| cx.new(|_| Tip(text.clone())).into()
 }
 
 pub fn text_button(
@@ -200,5 +300,38 @@ pub struct NoGhost;
 impl Render for NoGhost {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div().size(px(0.))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Icon;
+    use crate::assets::Assets;
+    use gpui::AssetSource;
+
+    #[test]
+    fn every_icon_is_in_the_bundle() {
+        let all = [
+            Icon::Sidebar,
+            Icon::Plus,
+            Icon::Minus,
+            Icon::Gear,
+            Icon::Dots,
+            Icon::FolderOpen,
+            Icon::X,
+            Icon::Play,
+            Icon::CaretDown,
+            Icon::CaretRight,
+            Icon::Prohibit,
+            Icon::ArrowSquareOut,
+            Icon::TerminalWindow,
+            Icon::SquaresFour,
+            Icon::ArrowLeft,
+        ];
+        for icon in all {
+            let bytes = Assets.load(icon.path()).unwrap().unwrap_or_else(|| panic!("{} is missing", icon.path()));
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert!(text.starts_with("<svg") && text.contains("viewBox") && text.contains("<path"), "{}", icon.path());
+        }
     }
 }

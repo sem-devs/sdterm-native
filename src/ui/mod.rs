@@ -110,6 +110,10 @@ pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 // ---- What the views need from the state ----------------------------------------------------
 
 pub(crate) struct Snapshot {
+    /// Height of the window, so a menu opens upward when there is no room below it.
+    pub window_height: f32,
+    /// The folder each terminal of the active workspace is in, by terminal id (shown while parked).
+    pub pane_folders: HashMap<String, String>,
     pub window_id: String,
     pub open_windows: Vec<String>,
     pub update: UpdateStatus,
@@ -132,6 +136,16 @@ pub(crate) struct Snapshot {
     pub setting_inputs: HashMap<&'static str, Entity<TextInput>>,
     /// The text field of whatever is being renamed or written, with what it is for.
     pub editor: Option<(Edit, Entity<TextInput>)>,
+    /// The fields of the editor of a terminal's name, note and color, while it is open.
+    pub pane_editor: Option<PaneFields>,
+}
+
+/// The two text fields of the editor of a terminal's details.
+#[derive(Clone)]
+pub struct PaneFields {
+    pub id: String,
+    pub name: Entity<TextInput>,
+    pub note: Entity<TextInput>,
 }
 
 impl Snapshot {
@@ -139,6 +153,7 @@ impl Snapshot {
         state: &AppState,
         window_id: &str,
         editor: Option<(Edit, Entity<TextInput>)>,
+        pane_editor: Option<PaneFields>,
         setting_inputs: HashMap<&'static str, Entity<TextInput>>,
         window: &Window,
         cx: &App,
@@ -150,7 +165,19 @@ impl Snapshot {
             .filter(|(_, v)| v.read(cx).focus_handle().is_focused(window))
             .map(|(id, _)| id.clone())
             .collect();
+        let pane_folders = state
+            .active_of(window_id)
+            .filter(|ws| ws.parked)
+            .map(|ws| {
+                ws.panes
+                    .iter()
+                    .filter_map(|p| state.pane_folder(&p.id).map(|f| (p.id.clone(), f.to_string_lossy().to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
+            window_height: f32::from(window.viewport_size().height),
+            pane_folders,
             window_id: window_id.to_string(),
             sidebar_collapsed: state.collapsed_of(window_id),
             view: state.view_of(window_id),
@@ -170,8 +197,14 @@ impl Snapshot {
             confirm_reset: state.confirm_reset,
             setting_inputs,
             editor,
+            pane_editor,
         }
     }
+}
+
+/// A shortcut as it is written on this system: ⌘B on a Mac, Ctrl+Shift+B elsewhere.
+pub fn shortcut(key: &str) -> String {
+    if MAC { format!("\u{2318}{key}") } else { format!("Ctrl+Shift+{key}") }
 }
 
 // ---- The root view -------------------------------------------------------------------------
@@ -181,6 +214,7 @@ pub struct Root {
     window_id: String,
     focus_subs: HashMap<String, Subscription>,
     editor: Option<(Edit, Entity<TextInput>, Subscription)>,
+    pane_editor: Option<(PaneFields, [Subscription; 2])>,
     setting_inputs: HashMap<&'static str, (Entity<TextInput>, Subscription)>,
     /// The window title last set, so it is only set again when it changes.
     last_title: String,
@@ -222,6 +256,7 @@ impl Root {
             window_id,
             focus_subs: HashMap::new(),
             editor: None,
+            pane_editor: None,
             setting_inputs: HashMap::new(),
             last_title: String::new(),
             _observe,
@@ -291,41 +326,95 @@ impl Root {
         }
     }
 
-    /// Creates the text field when something starts being edited, and drops it when it ends.
+    /// Creates the text field when a workspace starts being renamed, and drops it when it ends.
     fn sync_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let wanted = {
             let s = self.state.read(cx);
-            if s.edit_owner == self.window_id { s.editing.clone() } else { None }
+            match &s.editing {
+                Some(edit @ Edit::WorkspaceName(_)) if s.edit_owner == self.window_id => Some(edit.clone()),
+                _ => None,
+            }
         };
         if self.editor.as_ref().map(|(e, _, _)| e) == wanted.as_ref() {
             return;
         }
         self.editor = wanted.map(|edit| {
-            let (initial, placeholder, multiline) = {
-                let state = self.state.read(cx);
-                match &edit {
-                    Edit::WorkspaceName(id) => {
-                        (state.ws(id).map(|w| w.name.clone()).unwrap_or_default(), "Name", false)
-                    }
-                    Edit::PaneName(id) => (
-                        state.find_pane(id).map(|(w, i)| w.panes[i].name.clone()).unwrap_or_default(),
-                        "Name",
-                        false,
-                    ),
-                    Edit::PaneNote(id) => (
-                        state.find_pane(id).map(|(w, i)| w.panes[i].note.clone()).unwrap_or_default(),
-                        "What is this terminal for?",
-                        true,
-                    ),
-                }
+            let initial = match &edit {
+                Edit::WorkspaceName(id) => self.state.read(cx).ws(id).map(|w| w.name.clone()).unwrap_or_default(),
+                Edit::PaneDetails(_) => String::new(),
             };
-            let input = cx.new(|cx| TextInput::new(&initial, placeholder, multiline, true, window, cx));
+            let input = cx.new(|cx| TextInput::new(&initial, "Name", false, true, window, cx));
             input.read(cx).focus(window);
             let sub = cx.subscribe_in(&input, window, |this, _input, event: &InputEvent, _window, cx| {
                 this.on_input(event, cx);
             });
             (edit, input, sub)
         });
+    }
+
+    /// Creates the name and note fields while a terminal's details are open, and drops them after.
+    fn sync_pane_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let wanted = {
+            let s = self.state.read(cx);
+            match &s.editing {
+                Some(Edit::PaneDetails(id)) if s.edit_owner == self.window_id => Some(id.clone()),
+                _ => None,
+            }
+        };
+        if self.pane_editor.as_ref().map(|(f, _)| &f.id) == wanted.as_ref() {
+            return;
+        }
+        self.pane_editor = wanted.and_then(|id| {
+            let (name, note, position) = {
+                let state = self.state.read(cx);
+                let (ws, i) = state.find_pane(&id)?;
+                (ws.panes[i].name.clone(), ws.panes[i].note.clone(), i + 1)
+            };
+            let name_input =
+                cx.new(|cx| TextInput::new(&name, &format!("Terminal {position}"), false, true, window, cx));
+            let note_input = cx.new(|cx| {
+                TextInput::new(&note, "What are you working on? Where did you leave off?", true, false, window, cx)
+                    .with_rows(4)
+            });
+            name_input.read(cx).focus(window);
+            let subscribe = |input: &Entity<TextInput>, is_name: bool, cx: &mut Context<Self>| {
+                let id = id.clone();
+                cx.subscribe_in(input, window, move |this, _input, event: &InputEvent, window, cx| {
+                    this.on_pane_field(&id, is_name, event, window, cx);
+                })
+            };
+            let subs = [subscribe(&name_input, true, cx), subscribe(&note_input, false, cx)];
+            Some((PaneFields { id: id.clone(), name: name_input, note: note_input }, subs))
+        });
+    }
+
+    /// What typing in the name or the note of a terminal does: it is kept as it is written.
+    fn on_pane_field(
+        &mut self,
+        pane: &str,
+        is_name: bool,
+        event: &InputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            InputEvent::Changed(text) => self.state.update(cx, |s, cx| {
+                if is_name {
+                    s.rename_pane(pane, text, cx)
+                } else {
+                    s.set_pane_note(pane, text, cx)
+                }
+            }),
+            InputEvent::Submit(_) | InputEvent::Cancel => self.state.update(cx, |s, cx| s.end_edit(true, cx)),
+            InputEvent::Tab => {
+                if let Some((fields, _)) = &self.pane_editor {
+                    let next = if is_name { &fields.note } else { &fields.name };
+                    next.read(cx).focus(window);
+                }
+            }
+            // Moving between the two fields is not the end of the edit.
+            InputEvent::Blur(_) => {}
+        }
     }
 
     /// The text fields of the Terminal settings exist while that page is open.
@@ -368,7 +457,7 @@ impl Root {
             let sub = cx.subscribe_in(&input, window, move |this, _input, event: &InputEvent, _window, cx| {
                 let text = match event {
                     InputEvent::Submit(t) | InputEvent::Blur(t) => t.clone(),
-                    InputEvent::Cancel => return,
+                    InputEvent::Cancel | InputEvent::Changed(_) | InputEvent::Tab => return,
                 };
                 this.state.update(cx, |state, cx| {
                     state.update_settings(cx, |s| match key {
@@ -383,19 +472,16 @@ impl Root {
     }
 
     fn on_input(&mut self, event: &InputEvent, cx: &mut Context<Self>) {
-        let Some((edit, _input, _sub)) = self.editor.take() else { return };
         let (text, refocus) = match event {
             InputEvent::Submit(text) => (Some(text.clone()), true),
             InputEvent::Blur(text) => (Some(text.clone()), false),
             InputEvent::Cancel => (None, true),
+            InputEvent::Changed(_) | InputEvent::Tab => return,
         };
+        let Some((edit, _input, _sub)) = self.editor.take() else { return };
         self.state.update(cx, |state, cx| {
-            if let Some(text) = text {
-                match &edit {
-                    Edit::WorkspaceName(id) => state.rename_workspace(id, &text, cx),
-                    Edit::PaneName(id) => state.rename_pane(id, &text, cx),
-                    Edit::PaneNote(id) => state.set_pane_note(id, &text, cx),
-                }
+            if let (Some(text), Edit::WorkspaceName(id)) = (text, &edit) {
+                state.rename_workspace(id, &text, cx);
             }
             state.end_edit(refocus, cx);
         });
@@ -407,11 +493,13 @@ impl Render for Root {
         self.sync_focus(window, cx);
         self.sync_title(window, cx);
         self.sync_editor(window, cx);
+        self.sync_pane_editor(window, cx);
         self.sync_setting_inputs(window, cx);
         let theme = cx.global::<Theme>().clone();
         let editor = self.editor.as_ref().map(|(e, i, _)| (e.clone(), i.clone()));
+        let pane_editor = self.pane_editor.as_ref().map(|(f, _)| f.clone());
         let inputs = self.setting_inputs.iter().map(|(k, (i, _))| (*k, i.clone())).collect();
-        let snap = Snapshot::take(self.state.read(cx), &self.window_id, editor, inputs, window, cx);
+        let snap = Snapshot::take(self.state.read(cx), &self.window_id, editor, pane_editor, inputs, window, cx);
         let state = self.state.clone();
 
         let mut root = div()
