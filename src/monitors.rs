@@ -14,6 +14,7 @@ use crate::metrics::{Metric, WidgetKind};
 use crate::model::NetworkUnit;
 use crate::resources::{ProcessInfo, ResourceFeed, Sample, Sampler, format_bytes};
 use crate::state::AppState;
+use crate::text_input::{InputEvent, TextInput};
 use crate::theme::Theme;
 use crate::ui::charts::{ChartSeries, chart};
 
@@ -61,7 +62,7 @@ pub fn open(cx: &mut App, kind: WidgetKind, state: &Entity<AppState>) {
         cx.open_window(options, move |window, cx| {
             cx.new(|cx| {
                 watch_bounds(&state, key, window, cx);
-                ProcessesView::new(state.clone(), cx)
+                ProcessesView::new(state.clone(), window, cx)
             })
         })
         .ok()
@@ -187,36 +188,84 @@ fn metric_card(
 
 // ---- Processes window ----------------------------------------------------------------------
 
+/// A line of the processes list: one process, or all the processes with the same name.
+#[derive(Debug, PartialEq)]
+pub struct ProcessRow {
+    pub name: String,
+    /// The pid, or how many processes share the name when they are grouped.
+    pub detail: String,
+    pub cpu: f32,
+    pub rss: u64,
+}
+
+/// The lines to show: filtered by name, grouped by name when asked, the busiest `limit` first.
+pub fn process_rows(list: &[ProcessInfo], query: &str, grouped: bool, by_memory: bool, limit: usize) -> Vec<ProcessRow> {
+    let query = query.trim().to_lowercase();
+    let matching = list.iter().filter(|p| query.is_empty() || p.name.to_lowercase().contains(&query));
+    let mut rows: Vec<ProcessRow> = if grouped {
+        let mut by_name: Vec<(ProcessRow, usize)> = Vec::new();
+        for p in matching {
+            match by_name.iter_mut().find(|(row, _)| row.name == p.name) {
+                Some((row, count)) => {
+                    row.cpu += p.cpu;
+                    row.rss += p.rss;
+                    *count += 1;
+                }
+                None => by_name.push((ProcessRow { name: p.name.clone(), detail: String::new(), cpu: p.cpu, rss: p.rss }, 1)),
+            }
+        }
+        by_name
+            .into_iter()
+            .map(|(mut row, count)| {
+                if count > 1 {
+                    row.detail = format!("\u{d7}{count}");
+                }
+                row
+            })
+            .collect()
+    } else {
+        matching
+            .map(|p| ProcessRow { name: p.name.clone(), detail: p.pid.to_string(), cpu: p.cpu, rss: p.rss })
+            .collect()
+    };
+    if by_memory {
+        rows.sort_by_key(|r| std::cmp::Reverse(r.rss));
+    } else {
+        rows.sort_by(|a, b| b.cpu.total_cmp(&a.cpu));
+    }
+    rows.truncate(limit);
+    rows
+}
+
 pub struct ProcessesView {
-    rows: Vec<ProcessInfo>,
+    all: Vec<ProcessInfo>,
     by_memory: bool,
+    grouped: bool,
+    query: String,
+    filter: Entity<TextInput>,
     state: Entity<AppState>,
     sampler: Arc<Mutex<Sampler>>,
     _task: gpui::Task<()>,
     _observe: Subscription,
+    _filter_sub: Subscription,
 }
 
 impl ProcessesView {
-    fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+    fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let sampler = Arc::new(Mutex::new(Sampler::new()));
         let task = cx.spawn({
             let sampler = sampler.clone();
             async move |this, cx| {
                 loop {
-                    let by_memory = match this.update(cx, |view, _| view.by_memory) {
-                        Ok(b) => b,
-                        Err(_) => break,
-                    };
                     let sampler = sampler.clone();
-                    let rows = cx
-                        .background_executor()
-                        .spawn(async move { sampler.lock().processes(60, by_memory) })
-                        .await;
-                    if this.update(cx, |view, cx| {
-                        view.rows = rows;
-                        cx.notify();
-                    })
-                    .is_err()
+                    // Everything, busiest first: the view filters, groups and sorts what it shows.
+                    let all = cx.background_executor().spawn(async move { sampler.lock().processes(usize::MAX, false) }).await;
+                    if this
+                        .update(cx, |view, cx| {
+                            view.all = all;
+                            cx.notify();
+                        })
+                        .is_err()
                     {
                         break;
                     }
@@ -225,7 +274,25 @@ impl ProcessesView {
             }
         });
         let _observe = cx.observe(&state, |_, _, cx| cx.notify());
-        Self { rows: Vec::new(), by_memory: false, state, sampler, _task: task, _observe }
+        let filter = cx.new(|cx| TextInput::new("", "Filter by name", false, false, window, cx));
+        let _filter_sub = cx.subscribe_in(&filter, window, |this, _input, event: &InputEvent, _window, cx| {
+            if let InputEvent::Changed(text) = event {
+                this.query = text.clone();
+                cx.notify();
+            }
+        });
+        Self {
+            all: Vec::new(),
+            by_memory: false,
+            grouped: true,
+            query: String::new(),
+            filter,
+            state,
+            sampler,
+            _task: task,
+            _observe,
+            _filter_sub,
+        }
     }
 }
 
@@ -255,7 +322,7 @@ impl Render for ProcessesView {
         };
 
         let mut table = div().id("process-rows").flex().flex_col().flex_1().overflow_y_scroll();
-        for p in &self.rows {
+        for p in &process_rows(&self.all, &self.query, self.grouped, self.by_memory, 60) {
             table = table.child(
                 div()
                     .flex()
@@ -264,7 +331,7 @@ impl Render for ProcessesView {
                     .px_3()
                     .text_size(px(12.))
                     .child(div().flex_1().truncate().child(p.name.clone()))
-                    .child(div().w(px(56.)).text_color(theme.muted_foreground).child(p.pid.to_string()))
+                    .child(div().w(px(56.)).text_color(theme.muted_foreground).child(p.detail.clone()))
                     .child(div().w(px(56.)).flex().justify_end().child(format!("{:.1}%", p.cpu)))
                     .child(div().w(px(76.)).flex().justify_end().child(format_bytes(p.rss))),
             );
@@ -309,6 +376,36 @@ impl Render for ProcessesView {
                 div()
                     .flex()
                     .items_center()
+                    .gap_2()
+                    .px_3()
+                    .pb_2()
+                    .child(div().flex_1().min_w(px(0.)).child(self.filter.clone()))
+                    .child({
+                        let (grouped, accent, fg, muted) =
+                            (self.grouped, theme.accent, theme.foreground, theme.muted_foreground);
+                        div()
+                            .id("group-by-name")
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .h(px(28.))
+                            .px_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_size(px(12.))
+                            .when(grouped, |d| d.bg(accent).text_color(fg))
+                            .when(!grouped, |d| d.text_color(muted).hover(move |s| s.bg(accent)))
+                            .child("Group by name")
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.grouped = !view.grouped;
+                                cx.notify();
+                            }))
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
                     .h(px(24.))
                     .px_3()
                     .border_b_1()
@@ -316,10 +413,50 @@ impl Render for ProcessesView {
                     .text_size(px(11.))
                     .text_color(theme.muted_foreground)
                     .child(div().flex_1().child("Name"))
-                    .child(div().w(px(56.)).child("PID"))
+                    .child(div().w(px(56.)).child(if self.grouped { "Count" } else { "PID" }))
                     .child(div().w(px(56.)).flex().justify_end().child("CPU"))
                     .child(div().w(px(76.)).flex().justify_end().child("Memory")),
             )
             .child(table)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProcessInfo, process_rows};
+
+    fn p(pid: u32, name: &str, cpu: f32, rss: u64) -> ProcessInfo {
+        ProcessInfo { pid, name: name.into(), cpu, rss }
+    }
+
+    fn sample() -> Vec<ProcessInfo> {
+        vec![p(1, "Chrome", 10.0, 300), p(2, "Chrome", 20.0, 500), p(3, "zsh", 1.0, 50), p(4, "node", 40.0, 100)]
+    }
+
+    #[test]
+    fn grouping_adds_up_the_processes_with_the_same_name() {
+        let rows = process_rows(&sample(), "", true, false, 10);
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["node", "Chrome", "zsh"]);
+        assert_eq!((rows[1].cpu, rows[1].rss, rows[1].detail.as_str()), (30.0, 800, "\u{d7}2"));
+        assert_eq!(rows[0].detail, "");
+    }
+
+    #[test]
+    fn without_grouping_each_process_is_a_line_with_its_pid() {
+        let rows = process_rows(&sample(), "", false, false, 10);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].detail, "4");
+    }
+
+    #[test]
+    fn the_filter_ignores_case_and_surrounding_spaces() {
+        let rows = process_rows(&sample(), "  CHR ", false, true, 10);
+        assert_eq!(rows.iter().map(|r| r.detail.as_str()).collect::<Vec<_>>(), ["2", "1"]);
+    }
+
+    #[test]
+    fn only_the_busiest_are_kept() {
+        assert_eq!(process_rows(&sample(), "", false, false, 2).len(), 2);
     }
 }

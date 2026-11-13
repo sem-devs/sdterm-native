@@ -13,6 +13,8 @@ use crate::theme::Theme;
 const WEBSITE: &str = "https://sem-devs.com";
 const EMAIL: &str = "mailto:info@sem-devs.com";
 const GITHUB: &str = "https://github.com/sem-devs";
+const LINKEDIN: &str = "https://www.linkedin.com/company/sem-devs/";
+const INSTAGRAM: &str = "https://www.instagram.com/sem.json/";
 const REVIEW: &str = "https://g.page/r/CUJ_bpXLg9UKEBI/review";
 
 /// A change to the settings, from a click.
@@ -556,11 +558,35 @@ fn about(snap: &Snapshot, theme: &Theme, state: &Entity<AppState>) -> AnyElement
                     .py_2()
                     .child(link("l-web", "Website", WEBSITE))
                     .child(link("l-mail", "Email", EMAIL))
+                    .child(link("l-linkedin", "LinkedIn", LINKEDIN))
+                    .child(link("l-instagram", "Instagram", INSTAGRAM))
                     .child(link("l-git", "GitHub", GITHUB))
                     .child(link("l-rate", "Rate sdterm on Google ★★★★★", REVIEW))
                     .into_any_element(),
             ],
         ))
-        .child(section(theme, "Settings", None, vec![div().py_2().child(reset).into_any_element()]))
+        .child(section(
+            theme,
+            "Your data",
+            None,
+            vec![
+                row(
+                    theme,
+                    "Settings file",
+                    None,
+                    text_button("show-store", "Show in folder", theme, false, move |cx| {
+                        let file = crate::store::data_dir().join(crate::store::NATIVE_FILE);
+                        // Before anything is saved the file does not exist: show the folder then.
+                        cx.reveal_path(if file.exists() { &file } else { file.parent().unwrap_or(&file) })
+                    }),
+                ),
+                row(
+                    theme,
+                    "Reset all settings",
+                    Some("Restores every option to its default. Workspaces are kept."),
+                    reset,
+                ),
+            ],
+        ))
         .into_any_element()
 }
